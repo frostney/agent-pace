@@ -603,7 +603,7 @@ export function assess(
     // the aim is the target (100% with a reset banked); a window paced through another's cap makes the rest last to 100%
     const aim = goal === null ? 100 : goal;
     const horizon = bank?.deadline ? bank.hoursToDeadline : leftH;
-    const tokenCost = tokens ? fitTokenCost(r, tokens, now) : null;
+    const tokenCost = tokens ? fitTokenCost(r, tokens) : null;
     const measured = tokens && tokenCost ? laneRates(tokens, tokenCost, now) : null;
     const lane = lanePlan(w, aim, horizon, recentRate(r, w, now), lanes, measured);
     if (redeeming(bank)) {

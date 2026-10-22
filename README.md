@@ -108,7 +108,10 @@ where the window has room):
   history how many window points a dollar of that is worth, separately for each window (see
   [Points per dollar](#points-per-dollar)). A lane's burn is its spending over the last 30
   minutes, or since it started if that is later, times points per dollar. The lanes counted
-  are those that spent in the last 10 minutes.
+  are those that spent something in the last 10 minutes, which can be fewer than
+  `active_lanes`: a session with a recent message that cost nothing is open, not working. Each
+  request is counted once, at its final cost, in the session that first wrote it, so a forked
+  or resumed session's copied history is not counted again.
 - **Per-lane burn, shared out:** while points per dollar are not learned yet, the recent rate
   of the window (not the window average) is divided by the lanes active over the stretch it
   was measured on.
@@ -152,13 +155,15 @@ each measured lane's burn, highest first, and `token_cost` gives the learned
 
 The readings of one window, between resets and cut at any drop in use, make runs. A run from
 its first reading to its last moved Δu whole points while the local lanes spent D dollars, so
-a window's points per dollar are Σ Δu / Σ D over the runs of the last week. Each run's Δu is a
+a window's points per dollar are Σ Δu / Σ D over the runs the ledger covers (eight days, so
+the week that just ended keeps teaching the 7d window for a day into the next). Each run's Δu is a
 difference of whole points and so can be a point off; over n runs the sum can be n points off.
 The fit counts once Σ Δu is at least 3 points per run, which keeps that error within a third,
 the bar a recent rate has to clear.
 
-A run in which no local lane spent anything says nothing about what a local lane costs and is
-left out: another machine, or claude.ai, moved the window then. Use from elsewhere during a run
+A run in which the local lanes spent less than a twentieth of what they spent over all the runs
+says little about what a local lane costs and is left out: another machine, or claude.ai,
+moved the window then. Use from elsewhere during a run
 is counted against the local lanes, as the shared-out estimate counts it, so a busy other
 machine makes local lanes look more expensive than they are, never cheaper. List prices are
 ratios, not the subscription's own accounting: if a window weighs a kind of token or a model

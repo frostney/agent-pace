@@ -23,8 +23,8 @@ import type { TokenUse } from "./token-ledger.ts";
 export const LANE_RATE_SPAN_S = 1800;
 /** A lane that has spent for less than this is averaged over this much. */
 const MIN_LANE_SPAN_S = 300;
-/** Runs older than this no longer teach the fit. */
-const FIT_SPAN_S = 7 * 86400;
+/** A run whose local spending is less than this share of all the runs' says too little. */
+const MIN_RUN_SHARE = 0.05;
 /** A run shorter than this says little: two readings close together. */
 const MIN_RUN_S = 540;
 
@@ -64,20 +64,23 @@ function runs(rows: readonly HistoryRow[]): Run[] {
 }
 
 /** How many points of a window a dollar of local spending has been worth; null while unlearned. */
-export function fitTokenCost(rows: readonly HistoryRow[], use: TokenUse, now: number): TokenCost | null {
+export function fitTokenCost(rows: readonly HistoryRow[], use: TokenUse): TokenCost | null {
+  // runs since the ledger knew every lane's spending: a week back and a day, so the week that
+  // just ended still teaches the 7d window until the new one has moved
+  const known = runs(rows)
+    .filter((run) => run.t0 >= use.since)
+    .map((run) => ({ ...run, spent: use.spent(run.t0, run.t1) }))
+    .filter((run) => run.spent > 0);
+  const total = known.reduce((sum, run) => sum + run.spent, 0);
   let points = 0;
   let dollars = 0;
   let counted = 0;
-  for (const run of runs(rows)) {
-    if (run.t0 < Math.max(use.since, now - FIT_SPAN_S)) {
-      continue; // before the ledger knew every lane's spending
-    }
-    const spent = use.spent(run.t0, run.t1);
-    if (spent <= 0) {
-      continue;
+  for (const run of known) {
+    if (run.spent < MIN_RUN_SHARE * total) {
+      continue; // the lanes here barely spent: whatever moved the window, it was not them
     }
     points += run.du;
-    dollars += spent;
+    dollars += run.spent;
     counted += 1;
   }
   if (counted === 0 || points < EVIDENCE_POINTS * counted) {
@@ -89,12 +92,13 @@ export function fitTokenCost(rows: readonly HistoryRow[], use: TokenUse, now: nu
 /**
  * The burn (%/h of the window) of each lane that spent in the last LANE_IDLE_S: its spending
  * over the last LANE_RATE_SPAN_S, or since it started if that is later, times points per dollar.
+ * A lane that spent nothing lately is not working, whatever its session file says.
  */
 export function laneRates(use: TokenUse, fit: TokenCost, now: number): number[] {
   const active = use.byLane(now - LANE_IDLE_S, now);
   const rates: number[] = [];
   for (const [lane, { dollars, first }] of use.byLane(now - LANE_RATE_SPAN_S, now)) {
-    if (!active.has(lane)) {
+    if (!((active.get(lane)?.dollars ?? 0) > 0)) {
       continue;
     }
     const span = Math.max(MIN_LANE_SPAN_S, now - Math.max(now - LANE_RATE_SPAN_S, first));

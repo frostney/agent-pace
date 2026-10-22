@@ -3,16 +3,22 @@
 // response. The ledger keeps the cost of each lane per minute for the last eight days in
 // tokens-<source>.json, with how far into each file it has read, so a reading parses only
 // what was appended since the last one.
+//
+// One request can appear more than once. Claude Code writes each content block of a message
+// on its own line with the message's usage, and the last line carries the final output count;
+// a forked or resumed session copies earlier messages into a new file. So the ledger counts
+// each request once, at the largest cost any of its lines gives, in the lane that first wrote
+// it.
 
 import {
   closeSync,
-  fstatSync,
   mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
   readSync,
   renameSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join, relative } from "node:path";
@@ -26,27 +32,23 @@ import type { Source } from "./usage.ts";
 
 /** How long the ledger keeps a lane's costs: a week's window, and a day to fit it. */
 export const LEDGER_SPAN_S = 8 * 86400;
-const RECENT_IDS = 64;
 const CHUNK = 1 << 22;
-
-interface Cursor {
-  /** Bytes read so far: the start of the first line not yet read. */
-  offset: number;
-  /** Message or response ids counted lately: one Claude message spans several lines. */
-  recent: string[];
-  /** The model of the current Codex turn, which turn_context lines set. */
-  model: string | null;
-}
+const NEWLINE = 0x0a;
 
 /** [minute (unix seconds), lane, dollars] */
 type Bucket = [number, number, number];
+/** A request already counted: [minute, lane, dollars counted]. */
+type Seen = [number, number, number];
 
 interface LedgerFile {
-  version: 1;
+  version: 2;
   /** From when the ledger has every lane's costs. */
   since: number;
   lanes: string[];
-  files: Record<string, Cursor>;
+  /** Bytes read so far of each session file: the start of the first line not yet read. */
+  offsets: Record<string, number>;
+  /** The requests counted, by a hash of their id. */
+  seen: Record<string, Seen>;
   buckets: Bucket[];
 }
 
@@ -66,6 +68,10 @@ function count(value: unknown): number {
   }
 }
 
+function timeOf(value: unknown): number | null {
+  return typeof value === "string" ? parseIso(value.replaceAll("Z", "+00:00")) : null;
+}
+
 function claudeSpend(line: string): Spend | null {
   if (!line.includes('"type":"assistant"') || !line.includes('"usage"')) {
     return null;
@@ -74,8 +80,8 @@ function claudeSpend(line: string): Spend | null {
   const message = isRecord(event) ? get(event, "message") : null;
   const usage = isRecord(message) ? get(message, "usage") : null;
   const id = isRecord(message) ? get(message, "id") : null;
-  const timestamp = isRecord(event) ? get(event, "timestamp") : null;
-  if (!isRecord(usage) || typeof id !== "string" || typeof timestamp !== "string") {
+  const t = isRecord(event) ? timeOf(get(event, "timestamp")) : null;
+  if (!isRecord(usage) || typeof id !== "string" || t === null) {
     return null;
   }
   const model = get(message, "model");
@@ -89,17 +95,12 @@ function claudeSpend(line: string): Spend | null {
     cacheWrite1h: write1h,
     cacheWrite5m: Math.max(0, created - write1h),
   };
-  const price = claudePrice(typeof model === "string" ? model : "");
-  return { id, t: parseIso(timestamp.replaceAll("Z", "+00:00")), dollars: cost(tokens, price) };
+  // fast mode runs the same model at twice its price
+  const speed = get(usage, "speed") === "fast" ? 2 : 1;
+  return { id, t, dollars: speed * cost(tokens, claudePrice(typeof model === "string" ? model : "")) };
 }
 
-function codexSpend(line: string, cursor: Cursor): Spend | null {
-  if (line.includes('"turn_context"')) {
-    const event: unknown = JSON.parse(line);
-    const model = isRecord(event) ? get(get(event, "payload") ?? {}, "model") : null;
-    cursor.model = typeof model === "string" ? model : cursor.model;
-    return null;
-  }
+function codexSpend(line: string): Spend | null {
   if (!line.includes('"token_usage_record"')) {
     return null;
   }
@@ -107,10 +108,11 @@ function codexSpend(line: string, cursor: Cursor): Spend | null {
   const payload = isRecord(event) ? get(event, "payload") : null;
   const usage = isRecord(payload) ? get(payload, "usage") : null;
   const id = isRecord(payload) ? get(payload, "response_id") : null;
-  const timestamp = isRecord(event) ? get(event, "timestamp") : null;
-  if (!isRecord(usage) || typeof id !== "string" || typeof timestamp !== "string") {
+  const t = isRecord(event) ? timeOf(get(event, "timestamp")) : null;
+  if (!isRecord(usage) || typeof id !== "string" || t === null) {
     return null;
   }
+  // input_tokens includes the cached tokens (and any cache writes, priced as input)
   const input = count(get(usage, "input_tokens"));
   const cached = count(get(usage, "cached_input_tokens"));
   const tokens: Tokens = {
@@ -120,70 +122,79 @@ function codexSpend(line: string, cursor: Cursor): Spend | null {
     cacheWrite5m: 0,
     cacheWrite1h: 0,
   };
-  return { id, t: parseIso(timestamp.replaceAll("Z", "+00:00")), dollars: cost(tokens, codexPrice()) };
+  return { id, t, dollars: cost(tokens, codexPrice()) };
 }
 
-/** Session files under root written since `after`, by path. */
+/** A 52-bit FNV-1a hash of a request id, in base 36: short to store, collision-free in practice. */
+function idKey(id: string): string {
+  let hash = 0xcbf29ce484222325n;
+  for (let i = 0; i < id.length; i++) {
+    hash ^= BigInt(id.charCodeAt(i));
+    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return (hash >> 12n).toString(36);
+}
+
+/** Session files under root (links followed) written since `after`, with their sizes. */
 function sessionFiles(root: string, after: number, source: Source): Map<string, number> {
   const out = new Map<string, number>();
   const walk = (dir: string) => {
-    let entries: import("node:fs").Dirent[];
+    let names: string[];
     try {
-      entries = readdirSync(dir, { withFileTypes: true });
+      names = readdirSync(dir);
     } catch {
       return;
     }
-    for (const entry of entries) {
-      const path = join(dir, entry.name);
-      if (entry.isDirectory()) {
+    for (const name of names) {
+      const path = join(dir, name);
+      let stat: import("node:fs").Stats;
+      try {
+        stat = statSync(path);
+      } catch {
+        continue; // gone, or a link to nothing
+      }
+      if (stat.isDirectory()) {
         walk(path);
       } else if (
-        entry.isFile() &&
-        entry.name.endsWith(".jsonl") &&
-        (source === "claude" || entry.name.startsWith("rollout-"))
+        stat.isFile() &&
+        name.endsWith(".jsonl") &&
+        (source === "claude" || name.startsWith("rollout-")) &&
+        stat.mtimeMs / 1000 >= after
       ) {
-        out.set(path, 0);
+        out.set(path, stat.size);
       }
     }
   };
   walk(root);
-  for (const path of out.keys()) {
-    try {
-      const fd = openSync(path, "r");
-      try {
-        const stat = fstatSync(fd);
-        if (stat.mtimeMs / 1000 < after) {
-          out.delete(path);
-        } else {
-          out.set(path, stat.size);
-        }
-      } finally {
-        closeSync(fd);
-      }
-    } catch {
-      out.delete(path);
-    }
-  }
   return out;
 }
 
-/** The complete lines of path from offset on, and where the next unread line starts. */
-function* newLines(path: string, offset: number, size: number): Generator<string, void, undefined> {
+/**
+ * The complete lines of path from offset on, each with the offset just after it. Lines are
+ * split on bytes, so a character that a read cuts in two is decoded whole.
+ */
+function* newLines(path: string, offset: number, size: number): Generator<[string, number], void, undefined> {
   const fd = openSync(path, "r");
   try {
     const buffer = Buffer.alloc(Math.min(CHUNK, Math.max(1, size - offset)));
     let position = offset;
-    let pending = "";
+    let pending = Buffer.alloc(0);
+    let pendingStart = offset;
     while (position < size) {
       const n = readSync(fd, buffer, 0, Math.min(buffer.length, size - position), position);
       if (n === 0) {
         break;
       }
+      const bytes =
+        pending.length > 0 ? Buffer.concat([pending, buffer.subarray(0, n)]) : buffer.subarray(0, n);
       position += n;
-      const text = pending + buffer.toString("utf8", 0, n);
-      const lines = text.split("\n");
-      pending = lines.pop() ?? "";
-      yield* lines;
+      let start = 0;
+      for (let end = bytes.indexOf(NEWLINE); end >= 0; end = bytes.indexOf(NEWLINE, start)) {
+        yield [bytes.toString("utf8", start, end), pendingStart + end + 1];
+        start = end + 1;
+      }
+      pendingStart += start;
+      pending = Buffer.from(bytes.subarray(start));
     }
   } finally {
     closeSync(fd);
@@ -191,7 +202,7 @@ function* newLines(path: string, offset: number, size: number): Generator<string
 }
 
 function emptyLedger(now: number): LedgerFile {
-  return { version: 1, since: now - LEDGER_SPAN_S, lanes: [], files: {}, buckets: [] };
+  return { version: 2, since: now - LEDGER_SPAN_S, lanes: [], offsets: {}, seen: {}, buckets: [] };
 }
 
 function loadLedger(path: string, now: number): LedgerFile {
@@ -199,11 +210,12 @@ function loadLedger(path: string, now: number): LedgerFile {
     const data: unknown = JSON.parse(readFileSync(path, "utf8"));
     if (
       isRecord(data) &&
-      data.version === 1 &&
-      Array.isArray(data.buckets) &&
+      data.version === 2 &&
+      typeof data.since === "number" &&
       Array.isArray(data.lanes) &&
-      isRecord(data.files) &&
-      typeof data.since === "number"
+      Array.isArray(data.buckets) &&
+      isRecord(data.offsets) &&
+      isRecord(data.seen)
     ) {
       // written by this module, so it has the shape it wrote
       return data as unknown as LedgerFile;
@@ -214,17 +226,21 @@ function loadLedger(path: string, now: number): LedgerFile {
   return emptyLedger(now);
 }
 
-/** Reads what the lanes spent since the last reading into the ledger and returns it. */
+/** Reads what the lanes spent since the last reading into the ledger. */
 function update(ledger: LedgerFile, source: Source, root: string, now: number): void {
   const horizon = now - LEDGER_SPAN_S;
   const files = sessionFiles(root, horizon, source);
   const buckets = new Map<string, number>(ledger.buckets.map(([m, l, d]) => [`${m}:${l}`, d]));
   const laneIndex = new Map(ledger.lanes.map((lane, i) => [lane, i]));
+  const add = (minute: number, lane: number, dollars: number) => {
+    const key = `${minute}:${lane}`;
+    buckets.set(key, (buckets.get(key) ?? 0) + dollars);
+  };
   for (const [path, size] of files) {
     const lane = relative(root, path);
-    let cursor = ledger.files[lane];
-    if (cursor === undefined || size < cursor.offset) {
-      cursor = { offset: 0, recent: [], model: null }; // new, or rewritten from the start
+    let offset = ledger.offsets[lane] ?? 0;
+    if (size < offset) {
+      offset = 0; // rewritten from the start: what it holds again is counted once by its ids
     }
     let index = laneIndex.get(lane);
     if (index === undefined) {
@@ -232,31 +248,45 @@ function update(ledger: LedgerFile, source: Source, root: string, now: number): 
       ledger.lanes.push(lane);
       laneIndex.set(lane, index);
     }
-    let read = cursor.offset;
-    for (const line of newLines(path, cursor.offset, size)) {
-      read += Buffer.byteLength(line, "utf8") + 1;
-      let spend: Spend | null = null;
-      try {
-        spend = source === "claude" ? claudeSpend(line) : codexSpend(line, cursor);
-      } catch {
-        spend = null; // a line agent-pace does not understand costs nothing
+    try {
+      for (const [line, next] of newLines(path, offset, size)) {
+        offset = next;
+        let spend: Spend | null = null;
+        try {
+          spend = source === "claude" ? claudeSpend(line) : codexSpend(line);
+        } catch {
+          spend = null; // a line agent-pace does not understand costs nothing
+        }
+        if (spend === null || spend.t < horizon) {
+          continue;
+        }
+        const key = idKey(spend.id);
+        const counted = ledger.seen[key];
+        if (counted === undefined) {
+          const minute = Math.floor(spend.t / 60) * 60;
+          ledger.seen[key] = [minute, index, spend.dollars];
+          add(minute, index, spend.dollars);
+        } else if (spend.dollars > counted[2]) {
+          add(counted[0], counted[1], spend.dollars - counted[2]); // a later line of it costs more
+          counted[2] = spend.dollars;
+        }
       }
-      if (spend === null || spend.t < horizon || cursor.recent.includes(spend.id)) {
-        continue;
+    } catch (error) {
+      if (!isSystemError(error)) {
+        throw error;
       }
-      cursor.recent.push(spend.id);
-      if (cursor.recent.length > RECENT_IDS) {
-        cursor.recent.shift();
-      }
-      const key = `${Math.floor(spend.t / 60) * 60}:${index}`;
-      buckets.set(key, (buckets.get(key) ?? 0) + spend.dollars);
+      // unreadable this time: the next reading tries again from where this one stopped
     }
-    cursor.offset = read;
-    ledger.files[lane] = cursor;
+    ledger.offsets[lane] = offset;
   }
-  for (const lane of Object.keys(ledger.files)) {
+  for (const lane of Object.keys(ledger.offsets)) {
     if (!files.has(join(root, lane))) {
-      delete ledger.files[lane]; // gone, or untouched for longer than the ledger keeps
+      delete ledger.offsets[lane]; // gone, or untouched for longer than the ledger keeps
+    }
+  }
+  for (const [key, [minute]] of Object.entries(ledger.seen)) {
+    if (minute < horizon) {
+      delete ledger.seen[key];
     }
   }
   const kept = [...buckets]
@@ -267,12 +297,20 @@ function update(ledger: LedgerFile, source: Source, root: string, now: number): 
     .filter(([minute]) => minute >= horizon);
   // keep only the lanes something still refers to, renumbered
   const old = ledger.lanes;
-  const used = new Set([...kept.map(([, lane]) => old[lane]), ...Object.keys(ledger.files)]);
+  const used = new Set([
+    ...kept.map(([, lane]) => old[lane]),
+    ...Object.values(ledger.seen).map(([, lane]) => old[lane]),
+    ...Object.keys(ledger.offsets),
+  ]);
   ledger.lanes = old.filter((lane) => used.has(lane));
-  const renumber = new Map(ledger.lanes.map((lane, i) => [lane, i]));
+  const index = new Map(ledger.lanes.map((lane, i) => [lane, i]));
+  const renumber = (lane: number) => index.get(old[lane] ?? "") ?? 0;
   ledger.buckets = kept
-    .map(([minute, lane, dollars]): Bucket => [minute, renumber.get(old[lane] ?? "") ?? 0, dollars])
+    .map(([minute, lane, dollars]): Bucket => [minute, renumber(lane), dollars])
     .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  for (const seen of Object.values(ledger.seen)) {
+    seen[1] = renumber(seen[1]);
+  }
   ledger.since = Math.max(ledger.since, horizon);
 }
 
@@ -292,13 +330,14 @@ export class TokenUse {
     }
   }
 
-  /** The first bucket at or after minute t. */
-  private lowerBound(t: number): number {
+  /** The first bucket whose middle is after t. */
+  private after(t: number): number {
+    const minute = Math.floor((t - 30) / 60) * 60 + 60;
     let lo = 0;
     let hi = this.buckets.length;
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
-      if ((this.buckets[mid] as Bucket)[0] < t) {
+      if ((this.buckets[mid] as Bucket)[0] < minute) {
         lo = mid + 1;
       } else {
         hi = mid;
@@ -309,20 +348,15 @@ export class TokenUse {
 
   /** Dollars all lanes spent in the minutes whose middle falls in (since, until]. */
   spent(since: number, until: number): number {
-    const from = this.lowerBound(Math.floor((since - 30) / 60) * 60 + 60);
-    const to = this.lowerBound(Math.floor((until - 30) / 60) * 60 + 60);
-    return (this.prefix[to] ?? 0) - (this.prefix[from] ?? 0);
+    return (this.prefix[this.after(until)] ?? 0) - (this.prefix[this.after(since)] ?? 0);
   }
 
   /** Each lane's dollars in (since, until] and the first minute it spent in them. */
   byLane(since: number, until: number): Map<string, { dollars: number; first: number }> {
     const out = new Map<string, { dollars: number; first: number }>();
-    const from = this.lowerBound(Math.floor((since - 30) / 60) * 60 + 60);
-    for (let i = from; i < this.buckets.length; i++) {
+    const to = this.after(until);
+    for (let i = this.after(since); i < to; i++) {
       const [minute, lane, dollars] = this.buckets[i] as Bucket;
-      if (minute + 30 > until) {
-        break;
-      }
       const name = this.lanes[lane] ?? String(lane);
       const seen = out.get(name);
       out.set(name, { dollars: (seen?.dollars ?? 0) + dollars, first: seen ? seen.first : minute });

@@ -2,7 +2,16 @@
 // points per dollar learned from the window history, and the lane headroom that follows.
 
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { appendFileSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { fitTokenCost, laneRates } from "../src/token-burn.ts";
 import { type TokenUse, tokenReading } from "../src/token-ledger.ts";
@@ -98,7 +107,70 @@ describe("TokenLedger", () => {
     const use = await tokenReading(c.state, "claude", c.host());
     expect(use?.spent(NOW - 3600, NOW + 120)).toBeCloseTo(7, 9);
     const ledger = JSON.parse(readFileSync(join(c.state, "tokens-claude.json"), "utf8"));
-    expect(ledger.files["proj/a.jsonl"].offset).toBe(readFileSync(path).length);
+    expect(ledger.offsets["proj/a.jsonl"]).toBe(readFileSync(path).length);
+  });
+
+  test("a message copied into a forked session is counted once, in the lane that wrote it", async () => {
+    const original = lane("a", 3, 1);
+    await ledger();
+    // the fork copies the conversation so far, then goes on with a message of its own
+    const fork = join(c.dir, "claude-home/projects/proj/fork.jsonl");
+    writeFileSync(
+      fork,
+      readFileSync(original, "utf8") +
+        `${compact({ type: "assistant", timestamp: iso(M - 30), message: { id: "own", model: "claude-opus-5-5", usage: opusOutput(2) } })}\n`,
+    );
+    utimesSync(fork, NOW - 30, NOW - 30);
+    const use = await ledger();
+    expect(use.spent(NOW - 3600, NOW)).toBeCloseTo(5, 9);
+    expect(use.byLane(NOW - 3600, NOW).get("proj/a.jsonl")?.dollars).toBeCloseTo(3, 9);
+  });
+
+  test("a message's last line, which carries its final output count, is the one counted", async () => {
+    const path = join(c.dir, "claude-home/projects/proj/a.jsonl");
+    mkdirSync(join(c.dir, "claude-home/projects/proj"), { recursive: true });
+    const line = (dollars: number) =>
+      `${compact({ type: "assistant", timestamp: iso(M - 60), message: { id: "m", model: "claude-opus-5-5", usage: opusOutput(dollars) } })}\n`;
+    writeFileSync(path, line(0.5) + line(2));
+    utimesSync(path, NOW - 60, NOW - 60);
+    expect((await ledger()).spent(NOW - 3600, NOW)).toBeCloseTo(2, 9);
+  });
+
+  test("a character a read cuts in two moves no offset", async () => {
+    const path = join(c.dir, "claude-home/projects/proj/a.jsonl");
+    mkdirSync(join(c.dir, "claude-home/projects/proj"), { recursive: true });
+    // a user line long enough that the 4 MiB read ends inside its "é"
+    const filler = `${compact({ type: "user", content: "x" })}`;
+    const pad = 4 * 1024 * 1024 - Buffer.byteLength(filler) + 2;
+    const first = `${compact({ type: "user", content: `${"x".repeat(pad)}é` })}\n`;
+    const spend = (id: string, dollars: number) =>
+      `${compact({ type: "assistant", timestamp: iso(M - 60), message: { id, model: "claude-opus-5-5", usage: opusOutput(dollars) } })}\n`;
+    writeFileSync(path, first + spend("m1", 1));
+    utimesSync(path, NOW - 60, NOW - 60);
+    await ledger();
+    appendFileSync(path, spend("m2", 2));
+    const use = await ledger();
+    const kept = JSON.parse(readFileSync(join(c.state, "tokens-claude.json"), "utf8"));
+    expect(kept.offsets["proj/a.jsonl"]).toBe(readFileSync(path).length);
+    expect(use.spent(NOW - 3600, NOW)).toBeCloseTo(3, 9);
+  });
+
+  test("a file rewritten from the start is read again without counting twice", async () => {
+    const path = lane("a", 3, 1);
+    await ledger();
+    const text = readFileSync(path, "utf8").split("\n");
+    writeFileSync(path, `${text.slice(0, 2).join("\n")}\n`); // shorter than what was read: rewritten
+    utimesSync(path, NOW - 60, NOW - 60);
+    expect((await ledger()).spent(NOW - 3600, NOW)).toBeCloseTo(3, 9);
+  });
+
+  test("a session file reached through a link is read", async () => {
+    const real = lane("a", 2, 1);
+    const other = join(c.dir, "elsewhere");
+    mkdirSync(other);
+    renameSync(real, join(other, "a.jsonl"));
+    symlinkSync(join(other, "a.jsonl"), real);
+    expect((await ledger()).spent(NOW - 3600, NOW)).toBeCloseTo(2, 9);
   });
 
   test("a lane that aged out is dropped and the others keep their costs", async () => {
@@ -156,7 +228,7 @@ describe("TokenCost", () => {
       [NOW - 1800, 20, R5],
       [NOW, 30, R5],
     ] as const;
-    expect(fitTokenCost(rows, use, NOW)).toEqual({
+    expect(fitTokenCost(rows, use)).toEqual({
       pointsPerDollar: 20 / 90,
       runs: 1,
       points: 20,
@@ -175,13 +247,59 @@ describe("TokenCost", () => {
       [NOW - 660, 20, R5],
       [NOW, 22, R5],
     ] as const; // two points: off by up to a half
-    expect(fitTokenCost([...quiet, ...small], use, NOW)).toBeNull();
-    expect(fitTokenCost([...quiet, [NOW - 660, 20, R5], [NOW, 23, R5]], use, NOW)).toEqual({
+    expect(fitTokenCost([...quiet, ...small], use)).toBeNull();
+    expect(fitTokenCost([...quiet, [NOW - 660, 20, R5], [NOW, 23, R5]], use)).toEqual({
       pointsPerDollar: 3 / 10,
       runs: 1,
       points: 3,
       dollars: 10,
     });
+  });
+
+  test("the evidence bar asks for three points a run", async () => {
+    lane("a", 120, 1);
+    const use = await ledger();
+    // two runs of 2 and 3 points: 5 points, under the 6 two runs need
+    const two = [
+      [NOW - 7140, 10, R5 - 18000],
+      [NOW - 3660, 12, R5 - 18000],
+      [NOW - 3600, 0, R5],
+      [NOW, 3, R5],
+    ] as const;
+    expect(fitTokenCost(two, use)).toBeNull();
+    const enough = [two[0], two[1], two[2], [NOW, 4, R5]] as const;
+    expect(fitTokenCost(enough, use)?.points).toBe(6);
+  });
+
+  test("a run in which the local lanes barely spent is left out", async () => {
+    lane("a", 60, 1);
+    c.claudeSpending("b", [{ t: M - 30000, id: "tiny", model: "claude-opus-5-5", usage: opusOutput(0.5) }]);
+    const use = await ledger();
+    const rows = [
+      [NOW - 30060, 10, R5 - 36000],
+      [NOW - 25000, 40, R5 - 36000], // another machine moved this window 30 points; a lane here spent $0.50
+      [NOW - 3660, 10, R5],
+      [NOW, 30, R5],
+    ] as const;
+    expect(fitTokenCost(rows, use)).toEqual({ pointsPerDollar: 20 / 60, runs: 1, points: 20, dollars: 60 });
+  });
+
+  test("the week that just ended still teaches the 7d window", async () => {
+    c.claudeSpending(
+      "a",
+      Array.from({ length: 60 }, (_, i) => ({
+        t: M - 7.5 * 86400 + 60 * i,
+        id: `w${i}`,
+        model: "claude-opus-5-5",
+        usage: opusOutput(1),
+      })),
+    );
+    const use = await ledger();
+    const lastWeek = [
+      [NOW - 7.5 * 86400 - 60, 2, NOW - 3600],
+      [NOW - 7.5 * 86400 + 3600, 8, NOW - 3600],
+    ] as const; // began seven and a half days ago, within the eight the ledger keeps
+    expect(fitTokenCost(lastWeek, use)?.pointsPerDollar).toBeCloseTo(6 / 60, 9);
   });
 
   test("each lane burns at its own rate", async () => {
@@ -278,6 +396,13 @@ describe("TokenLanes", () => {
       [Math.round(rate * 100) / 100],
     ]);
     expect(five.lane_headroom).toBe(Math.floor(((97 - 2) / ((R5 - NOW) / 3600) - rate) / rate));
+  });
+
+  test("a lane that spent nothing lately is not counted as burning", async () => {
+    lane("a", 60, 1);
+    c.claudeSpending("idle", [{ t: M - 120, id: "idle-0", model: "claude-opus-5-5", usage: opusOutput(0) }]);
+    const use = await ledger();
+    expect(laneRates(use, { pointsPerDollar: 0.2, runs: 1, points: 20, dollars: 100 }, NOW)).toHaveLength(1);
   });
 
   test("without a learned cost the lanes are shared out as before", async () => {
