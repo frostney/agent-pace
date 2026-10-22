@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: bun run check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint, typecheck and run the parity suite
+        run: bun run check
+
+      - name: Build the binary and pick the source from the name it runs as
+        run: |
+          bun run build
+          ln -s agent-pace dist/claude-pace
+          ln -s agent-pace dist/codex-pace
+          ./dist/agent-pace --help | grep -q '{claude,codex,plan}'
+          ./dist/claude-pace --help | head -1 | grep -q '^usage: claude-pace '
+          if ./dist/claude-pace --help | grep -q '{claude,codex,plan}'; then exit 1; fi
+          ./dist/codex-pace --help | head -1 | grep -q '^usage: codex-pace '

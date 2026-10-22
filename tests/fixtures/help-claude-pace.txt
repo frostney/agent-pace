@@ -1,0 +1,38 @@
+usage: claude-pace [-h] [--watch] [--alerts-only] [--json] [--target TARGET]
+                   [--band BAND] [--interval INTERVAL] [--plan {fill,even}]
+                   [--reserve RESERVE] [--redeem-margin HOURS] [--state STATE]
+                   [--notify CMD]
+
+Pace agent work against Claude Code and Codex usage windows, including banked
+resets, and say how many more agent lanes the headroom supports. `plan` reads
+both once and recommends where spare work should go. It never redeems a reset.
+
+options:
+  -h, --help            show this help message and exit
+  --watch
+  --alerts-only
+  --json
+  --target TARGET
+  --band BAND
+  --interval INTERVAL
+  --plan {fill,even}
+  --reserve RESERVE     with --plan fill, pace like --plan even once the long
+                        window has this many points left
+  --redeem-margin HOURS
+                        aim to fill a window to 100% this many hours before a
+                        banked reset expires; at the limit, keep a banked
+                        reset (nothing expires first) if the window resets on
+                        its own within this many hours
+  --state STATE
+  --notify CMD          run CMD with the alert text as its last argument on
+                        each alert or reset
+
+Lane headroom: per-lane burn is a window's recent burn over the lanes active
+meanwhile, time-weighted (each count covers the 10 minutes before it). Usage
+comes in whole points, so a rate needs to be known to within a third: two
+steps up timed by the readings around them, use moving 3 points, or a stretch
+of a fifth of the window, which bounds the burn by one point more than it
+moved. Until then it says "measuring"; a short window's status uses the same
+rate. A window that cannot be measured does not hold the source at "measuring"
+if, after its first hour, even twice its average burn would end it at or below
+its aim.

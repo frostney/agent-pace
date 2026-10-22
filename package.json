@@ -1,0 +1,52 @@
+{
+  "name": "agent-pace",
+  "private": true,
+  "version": "1.4.0",
+  "description": "Pace AI coding-agent work against Claude Code and Codex usage windows, banked resets and lane headroom.",
+  "license": "MIT",
+  "author": "Johannes Stein",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/frostney/agent-pace.git"
+  },
+  "homepage": "https://github.com/frostney/agent-pace#readme",
+  "bugs": {
+    "url": "https://github.com/frostney/agent-pace/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "usage",
+    "rate-limits",
+    "agents",
+    "cli",
+    "bun"
+  ],
+  "bin": {
+    "agent-pace": "bin/agent-pace.ts",
+    "claude-pace": "bin/claude-pace.ts",
+    "codex-pace": "bin/codex-pace.ts"
+  },
+  "files": [
+    "bin",
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
+  "packageManager": "bun@1.4.3",
+  "scripts": {
+    "check": "biome ci . && tsc --noEmit && bun test",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "compile": "bun build --compile --minify --bytecode --format=esm bin/agent-pace.ts",
+    "build": "bun run compile --outfile dist/agent-pace"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.2",
+    "@types/bun": "1.4.3",
+    "typescript": "7.0.2"
+  }
+}
