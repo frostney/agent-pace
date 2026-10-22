@@ -8,13 +8,13 @@ interface Price {
   readonly input: number;
   readonly output: number;
   readonly cacheRead: number;
-  readonly cacheWrite5m: number;
-  readonly cacheWrite1h: number;
+  readonly cacheWriteShort: number;
+  readonly cacheWriteLong: number;
 }
 
 /** Claude list prices as of October 2026: cache writes at 1.25x (5 minutes) and 2x (1 hour) input. */
 function claude(input: number, output: number, cacheRead: number): Price {
-  return { input, output, cacheRead, cacheWrite5m: input * 1.25, cacheWrite1h: input * 2 };
+  return { input, output, cacheRead, cacheWriteShort: input * 1.25, cacheWriteLong: input * 2 };
 }
 
 const CLAUDE_PRICES: ReadonlyMap<string, Price> = new Map([
@@ -42,18 +42,6 @@ const CLAUDE_FAMILIES: readonly (readonly [string, string])[] = [
   ["haiku", "claude-haiku-5-5"],
 ];
 
-/**
- * Codex models are priced at the GPT-5 family's ratios (cached input a tenth of input, output
- * eight times it). One Codex model at a time sets the level, and the learned scale absorbs it.
- */
-const CODEX_PRICE: Price = {
-  input: 1.25,
-  output: 10,
-  cacheRead: 0.125,
-  cacheWrite5m: 1.25,
-  cacheWrite1h: 1.25,
-};
-
 export function claudePrice(model: string): Price {
   const listed = CLAUDE_PRICES.get(model);
   if (listed) {
@@ -63,13 +51,87 @@ export function claudePrice(model: string): Price {
   return CLAUDE_PRICES.get(family?.[1] ?? "claude-opus-5-5") ?? claude(4, 20, 0.2);
 }
 
-/** Tokens of one request, by kind. Input excludes cache reads and writes. */
+/**
+ * OpenAI list prices as of October 2026, Standard tier, for prompts of up to 272K input tokens.
+ * From GPT-5.6 on, a cache write costs 1.25x input for the default 30 minutes and 2.5x for 12
+ * hours; earlier models bill no cache writes, so their written tokens cost what input does.
+ */
+function openai(input: number, output: number, cacheRead: number, writes = true): Price {
+  return writes
+    ? { input, output, cacheRead, cacheWriteShort: input * 1.25, cacheWriteLong: input * 2.5 }
+    : { input, output, cacheRead, cacheWriteShort: input, cacheWriteLong: input };
+}
+
+const CODEX_PRICES: ReadonlyMap<string, Price> = new Map([
+  ["gpt-6-astra", openai(10, 50, 1)],
+  ["gpt-6.1-sol", openai(2, 10, 0.1)],
+  ["gpt-6-sol", openai(2, 10, 0.2)],
+  ["gpt-6-luna", openai(0.1, 0.5, 0.01)],
+  ["gpt-5.6-sol", openai(4, 20, 0.4)], // a promotional price, at least through 2026-11-21
+  ["gpt-5.6-terra", openai(2, 12, 0.2)],
+  ["gpt-5.6-luna", openai(0.2, 1.2, 0.02)],
+  ["gpt-5.5", openai(5, 30, 0.5, false)],
+  ["gpt-5.5-pro", openai(30, 180, 30, false)], // no cached-input rate
+  ["gpt-5.4", openai(2.5, 15, 0.25, false)],
+  ["gpt-5.4-pro", openai(30, 180, 30, false)],
+]);
+
+/** A model this table does not list is priced as the current model of its tier. */
+const CODEX_FAMILIES: readonly (readonly [string, string])[] = [
+  ["astra", "gpt-6-astra"],
+  ["sol", "gpt-6.1-sol"],
+  ["terra", "gpt-5.6-terra"],
+  ["luna", "gpt-6-luna"],
+];
+
+/** A prompt of more input tokens than this is billed at long-context rates for the whole request. */
+const OPENAI_SHORT_CONTEXT = 272_000;
+
+/**
+ * The price of one Codex request: its model's, a dated snapshot priced as the model, at
+ * long-context rates (2x input and cache, 1.5x output) when its prompt is longer than 272K.
+ */
+export function codexPrice(model: string, prompt: number): Price {
+  const base = model.replace(/-\d{4}-\d{2}-\d{2}$/, "");
+  const family = CODEX_FAMILIES.find(([name]) => base.split("-").includes(name));
+  const price =
+    CODEX_PRICES.get(base) ?? CODEX_PRICES.get(family?.[1] ?? "gpt-6.1-sol") ?? openai(2, 10, 0.1);
+  if (prompt <= OPENAI_SHORT_CONTEXT) {
+    return price;
+  }
+  return {
+    input: price.input * 2,
+    output: price.output * 1.5,
+    cacheRead: price.cacheRead * 2,
+    cacheWriteShort: price.cacheWriteShort * 2,
+    cacheWriteLong: price.cacheWriteLong * 2,
+  };
+}
+
+/** What a Codex service tier costs against Standard: Fast is twice it, Ultrafast six times. */
+export function codexTierFactor(tier: string): number {
+  switch (tier) {
+    case "priority":
+      return 2;
+    case "ultrafast":
+      return 6;
+    case "flex":
+      return 0.5;
+    default:
+      return 1;
+  }
+}
+
+/**
+ * Tokens of one request, by kind. Input excludes cache reads and writes. A short cache write
+ * lasts 5 minutes on Claude and 30 minutes on OpenAI; a long one an hour and 12 hours.
+ */
 export interface Tokens {
   readonly input: number;
   readonly output: number;
   readonly cacheRead: number;
-  readonly cacheWrite5m: number;
-  readonly cacheWrite1h: number;
+  readonly cacheWriteShort: number;
+  readonly cacheWriteLong: number;
 }
 
 export function cost(tokens: Tokens, price: Price): number {
@@ -77,12 +139,8 @@ export function cost(tokens: Tokens, price: Price): number {
     (tokens.input * price.input +
       tokens.output * price.output +
       tokens.cacheRead * price.cacheRead +
-      tokens.cacheWrite5m * price.cacheWrite5m +
-      tokens.cacheWrite1h * price.cacheWrite1h) /
+      tokens.cacheWriteShort * price.cacheWriteShort +
+      tokens.cacheWriteLong * price.cacheWriteLong) /
     1e6
   );
-}
-
-export function codexPrice(): Price {
-  return CODEX_PRICE;
 }

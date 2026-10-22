@@ -15,6 +15,7 @@ import {
 import { join } from "node:path";
 import { fitTokenCost, laneRates } from "../src/token-burn.ts";
 import { type TokenUse, tokenReading } from "../src/token-ledger.ts";
+import { codexPrice, codexTierFactor } from "../src/token-prices.ts";
 import { Case, compact, type Fields, iso, NOW } from "./harness.ts";
 
 setDefaultTimeout(30_000);
@@ -271,30 +272,73 @@ describe("TokenLedger", () => {
     ]);
   });
 
-  test("codex responses are priced from their usage records", async () => {
+  test("codex responses are priced by their own model and service tier", async () => {
     const dir = join(c.dir, "codex-home/sessions/2025/10/22");
     mkdirSync(dir, { recursive: true });
     const path = join(dir, "rollout-x.jsonl");
+    const line = (t: number, type: string, payload: Fields) =>
+      `${JSON.stringify({ timestamp: iso(t), type, payload })}\n`;
     const record = (t: number, id: string, usage: Fields) =>
-      `${JSON.stringify({ timestamp: iso(t), type: "token_usage_record", payload: { response_id: id, usage } })}\n`;
+      line(t, "token_usage_record", { response_id: id, usage });
+    const usage = {
+      input_tokens: 200_000,
+      cached_input_tokens: 100_000,
+      cache_write_input_tokens: 50_000,
+      output_tokens: 10_000,
+    };
+    const fast = (model: string) =>
+      line(M - 200, "event_msg", {
+        type: "thread_settings_applied",
+        thread_settings: { model, service_tier: "priority" },
+      });
     writeFileSync(
       path,
-      `${JSON.stringify({ timestamp: iso(M - 300), type: "turn_context", payload: { model: "gpt-x" } })}\n` +
-        record(M - 120, "r1", {
-          input_tokens: 1_000_000,
-          cached_input_tokens: 800_000,
-          output_tokens: 100_000,
-        }) +
-        record(M - 120, "r1", {
-          input_tokens: 1_000_000,
-          cached_input_tokens: 800_000,
-          output_tokens: 100_000,
-        }),
+      line(M - 300, "turn_context", { model: "gpt-6-sol" }) +
+        record(M - 240, "r1", usage) +
+        record(M - 240, "r1", usage) +
+        // a message that only mentions the settings changes nothing
+        line(M - 230, "response_item", { type: "message", text: '"turn_context" model', model: "gpt-x" }) +
+        record(M - 220, "r2", { input_tokens: 300_000, output_tokens: 10_000 }) +
+        fast("gpt-6.1-sol") +
+        record(M - 180, "r3", usage),
     );
     utimesSync(path, NOW - 60, NOW - 60);
-    const use = await tokenReading(c.state, "codex", c.host());
-    // 200k uncached at $1.25, 800k cached at $0.125, 100k output at $10, once
-    expect(use?.spent(NOW - 3600, NOW)).toBeCloseTo(0.25 + 0.1 + 1, 9);
+    const first = await tokenReading(c.state, "codex", c.host());
+    // gpt-6-sol: 50k uncached at $2, 100k cached at $0.20, 50k written at $2.50, 10k output at $10
+    const sol = 0.1 + 0.02 + 0.125 + 0.1;
+    // a 300k prompt is long context: input at $4, output at $15
+    const long = 1.2 + 0.15;
+    // gpt-6.1-sol caches at $0.10, at twice the price in the priority tier
+    const fastSol = 2 * (0.1 + 0.01 + 0.125 + 0.1);
+    expect(first?.spent(NOW - 3600, NOW)).toBeCloseTo(sol + long + fastSol, 9);
+    // the next reading starts where this one stopped, still on gpt-6.1-sol in the priority tier
+    appendFileSync(path, record(M - 60, "r4", usage));
+    utimesSync(path, NOW - 30, NOW - 30);
+    const second = await tokenReading(c.state, "codex", c.host());
+    expect(second?.spent(NOW - 3600, NOW)).toBeCloseTo(sol + long + 2 * fastSol, 9);
+  });
+});
+
+describe("codexPrice", () => {
+  test("a dated snapshot is priced as its model", () => {
+    expect(codexPrice("gpt-6-sol-2026-08-01", 1000)).toEqual(codexPrice("gpt-6-sol", 1000));
+  });
+
+  test("an unlisted model is priced as the current model of its tier", () => {
+    expect(codexPrice("gpt-7-astra", 1000)).toEqual(codexPrice("gpt-6-astra", 1000));
+    expect(codexPrice("gpt-6.2-sol", 1000)).toEqual(codexPrice("gpt-6.1-sol", 1000));
+    expect(codexPrice("gpt-6-luna", 1000).input).toBe(0.1);
+  });
+
+  test("models before GPT-5.6 bill cache writes as input", () => {
+    expect(codexPrice("gpt-5.5", 1000).cacheWriteShort).toBe(5);
+    expect(codexPrice("gpt-5.6-sol", 1000).cacheWriteShort).toBe(5);
+  });
+
+  test("service tiers scale the Standard price", () => {
+    expect(["default", "priority", "ultrafast", "flex", "other"].map(codexTierFactor)).toEqual([
+      1, 2, 6, 0.5, 1,
+    ]);
   });
 });
 

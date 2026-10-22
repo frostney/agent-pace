@@ -168,8 +168,17 @@ is counted against the local lanes, as the shared-out estimate counts it, so a b
 machine makes local lanes look more expensive than they are, never cheaper. List prices are
 ratios, not the subscription's own accounting: if a window weighs a kind of token or a model
 differently from its price, lanes whose mix differs from the average are measured that much
-off. Codex models are priced at the GPT-5 family's ratios (cached input a tenth of input,
-output eight times it).
+off.
+
+Each request is priced by its own model, at the list prices in `src/token-prices.ts`. A Claude
+message names its model and fast mode doubles it. A Codex usage record names neither, so each
+rollout's latest `turn_context` and `thread_settings_applied` lines supply its model and
+service tier: Fast (`priority`) costs twice Standard, Ultrafast six times and Flex half. A
+Codex prompt over 272K input tokens is billed at long-context rates (input and cache twice,
+output one and a half times), and its cache writes at the default 30-minute rate. A rollout
+written before Codex recorded its tier is priced at Standard. A model the tables do not list
+is priced as the current model of its family (Claude) or tier name (Codex `sol`, `astra`,
+`terra`, `luna`), and otherwise as Opus 5.5 or GPT-6.1 Sol.
 
 ### plan
 

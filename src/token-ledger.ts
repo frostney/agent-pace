@@ -9,6 +9,10 @@
 // a forked or resumed session copies earlier messages into a new file. So the ledger counts
 // each request once, at the largest cost any of its lines gives, in the lane that first wrote
 // it.
+//
+// A Codex usage record does not name its model or service tier; the thread's latest
+// turn_context and thread_settings_applied lines before it do, so the ledger carries them
+// along each rollout file from one reading to the next.
 
 import {
   closeSync,
@@ -28,7 +32,7 @@ import { withLock } from "./file-lock.ts";
 import { claudeHome, codexHome, type Host } from "./host.ts";
 import { get, isRecord, toFloat } from "./python-json.ts";
 import { parseIso } from "./time-format.ts";
-import { claudePrice, codexPrice, cost, type Tokens } from "./token-prices.ts";
+import { claudePrice, codexPrice, codexTierFactor, cost, type Tokens } from "./token-prices.ts";
 import type { Source } from "./usage.ts";
 
 /** How long the ledger keeps a lane's costs: a week's window, and a day to fit it. */
@@ -40,14 +44,18 @@ const NEWLINE = 0x0a;
 type Bucket = [number, number, number];
 /** A request already counted: [minute, lane, dollars counted]. */
 type Seen = [number, number, number];
+/** The model and service tier a Codex rollout's requests run at so far. */
+type CodexSetting = [string, string];
 
 interface LedgerFile {
-  version: 2;
+  version: 3;
   /** From when the ledger has every lane's costs. */
   since: number;
   lanes: string[];
   /** Bytes read so far of each session file: the start of the first line not yet read. */
   offsets: Record<string, number>;
+  /** Each Codex rollout's setting as of its offset. */
+  settings: Record<string, CodexSetting>;
   /** The requests counted, by a hash of their id. */
   seen: Record<string, Seen>;
   buckets: Bucket[];
@@ -93,15 +101,40 @@ function claudeSpend(line: string): Spend | null {
     input: count(get(usage, "input_tokens")),
     output: count(get(usage, "output_tokens")),
     cacheRead: count(get(usage, "cache_read_input_tokens")),
-    cacheWrite1h: write1h,
-    cacheWrite5m: Math.max(0, created - write1h),
+    cacheWriteShort: Math.max(0, created - write1h),
+    cacheWriteLong: write1h,
   };
   // fast mode runs the same model at twice its price
   const speed = get(usage, "speed") === "fast" ? 2 : 1;
   return { id, t, dollars: speed * cost(tokens, claudePrice(typeof model === "string" ? model : "")) };
 }
 
-function codexSpend(line: string): Spend | null {
+function codexSpend(line: string, setting: CodexSetting): Spend | null {
+  if (line.includes('"turn_context"') || line.includes('"thread_settings_applied"')) {
+    const event: unknown = JSON.parse(line);
+    const payload = isRecord(event) ? get(event, "payload") : null;
+    if (!isRecord(payload)) {
+      return null;
+    }
+    const applied = get(payload, "type") === "thread_settings_applied";
+    const settings = applied
+      ? get(payload, "thread_settings")
+      : get(event, "type") === "turn_context"
+        ? payload
+        : null;
+    if (!isRecord(settings)) {
+      return null; // a line that only mentions them
+    }
+    const model = get(settings, "model");
+    if (typeof model === "string") {
+      setting[0] = model;
+    }
+    if (applied) {
+      const tier = get(settings, "service_tier");
+      setting[1] = typeof tier === "string" ? tier : "default";
+    }
+    return null;
+  }
   if (!line.includes('"token_usage_record"')) {
     return null;
   }
@@ -113,17 +146,20 @@ function codexSpend(line: string): Spend | null {
   if (!isRecord(usage) || typeof id !== "string" || t === null) {
     return null;
   }
-  // input_tokens includes the cached tokens (and any cache writes, priced as input)
-  const input = count(get(usage, "input_tokens"));
+  // input_tokens counts the whole prompt: the cached tokens and the cache writes are part of it
+  const prompt = count(get(usage, "input_tokens"));
   const cached = count(get(usage, "cached_input_tokens"));
+  const written = count(get(usage, "cache_write_input_tokens"));
   const tokens: Tokens = {
-    input: Math.max(0, input - cached),
+    input: Math.max(0, prompt - cached - written),
     output: count(get(usage, "output_tokens")),
     cacheRead: cached,
-    cacheWrite5m: 0,
-    cacheWrite1h: 0,
+    // Codex sets no cache lifetime, so a write lasts the default 30 minutes
+    cacheWriteShort: written,
+    cacheWriteLong: 0,
   };
-  return { id, t, dollars: cost(tokens, codexPrice()) };
+  const [model, tier] = setting;
+  return { id, t, dollars: codexTierFactor(tier) * cost(tokens, codexPrice(model, prompt)) };
 }
 
 /** A 52-bit FNV-1a hash of a request id, in base 36: short to store, collision-free in practice. */
@@ -212,7 +248,15 @@ function* newLines(path: string, offset: number, size: number): Generator<[strin
 }
 
 function emptyLedger(now: number): LedgerFile {
-  return { version: 2, since: now - LEDGER_SPAN_S, lanes: [], offsets: {}, seen: {}, buckets: [] };
+  return {
+    version: 3,
+    since: now - LEDGER_SPAN_S,
+    lanes: [],
+    offsets: {},
+    settings: {},
+    seen: {},
+    buckets: [],
+  };
 }
 
 function loadLedger(path: string, now: number): LedgerFile {
@@ -220,11 +264,12 @@ function loadLedger(path: string, now: number): LedgerFile {
     const data: unknown = JSON.parse(readFileSync(path, "utf8"));
     if (
       isRecord(data) &&
-      data.version === 2 &&
+      data.version === 3 &&
       typeof data.since === "number" &&
       Array.isArray(data.lanes) &&
       Array.isArray(data.buckets) &&
       isRecord(data.offsets) &&
+      isRecord(data.settings) &&
       isRecord(data.seen)
     ) {
       // written by this module, so it has the shape it wrote
@@ -249,8 +294,10 @@ function update(ledger: LedgerFile, source: Source, root: string, now: number): 
   for (const [path, size] of files) {
     const lane = relative(root, path);
     let offset = ledger.offsets[lane] ?? 0;
+    let setting: CodexSetting = [...(ledger.settings[lane] ?? ["", "default"])];
     if (size < offset) {
       offset = 0; // rewritten from the start: what it holds again is counted once by its ids
+      setting = ["", "default"];
     }
     let index = laneIndex.get(lane);
     if (index === undefined) {
@@ -263,7 +310,7 @@ function update(ledger: LedgerFile, source: Source, root: string, now: number): 
         offset = next;
         let spend: Spend | null = null;
         try {
-          spend = source === "claude" ? claudeSpend(line) : codexSpend(line);
+          spend = source === "claude" ? claudeSpend(line) : codexSpend(line, setting);
         } catch {
           spend = null; // a line agent-pace does not understand costs nothing
         }
@@ -288,10 +335,14 @@ function update(ledger: LedgerFile, source: Source, root: string, now: number): 
       // unreadable this time: the next reading tries again from where this one stopped
     }
     ledger.offsets[lane] = offset;
+    if (source === "codex") {
+      ledger.settings[lane] = setting;
+    }
   }
   for (const lane of Object.keys(ledger.offsets)) {
     if (!files.has(join(root, lane))) {
       delete ledger.offsets[lane]; // gone, or untouched for longer than the ledger keeps
+      delete ledger.settings[lane];
     }
   }
   for (const [key, [minute]] of Object.entries(ledger.seen)) {
