@@ -96,6 +96,26 @@ describe("TokenLedger", () => {
     expect(use?.spent(NOW - 3600, NOW)).toBeCloseTo(2 + 10 + 0.2 + 2.5 + 8 + 4, 9);
   });
 
+  test("a Haiku 5.5 prompt over 100K tokens pays five times every rate", async () => {
+    // a prompt of input, cache reads and cache writes: 10k + 60k + 30k is exactly 100K
+    const haiku = (input: number) => ({
+      input_tokens: input,
+      output_tokens: 1_000,
+      cache_read_input_tokens: 60_000,
+      cache_creation_input_tokens: 30_000,
+      cache_creation: { ephemeral_5m_input_tokens: 30_000, ephemeral_1h_input_tokens: 0 },
+    });
+    c.claudeSpending("under", [{ t: M - 60, id: "h1", model: "claude-haiku-5-5", usage: haiku(10_000) }]);
+    c.claudeSpending("over", [{ t: M - 60, id: "h2", model: "claude-haiku-5-5", usage: haiku(10_010) }]);
+    const use = await tokenReading(c.state, "claude", c.host());
+    const lanes = use?.byLane(NOW - 3600, NOW);
+    // $0.10 input, $0.01 cache read, $0.125 5-minute write, $0.50 output
+    const under = (10_000 * 0.1 + 60_000 * 0.01 + 30_000 * 0.125 + 1_000 * 0.5) / 1e6;
+    const over = (5 * (10_010 * 0.1 + 60_000 * 0.01 + 30_000 * 0.125 + 1_000 * 0.5)) / 1e6;
+    expect(lanes?.get("proj/under.jsonl")?.dollars).toBeCloseTo(under, 9);
+    expect(lanes?.get("proj/over.jsonl")?.dollars).toBeCloseTo(over, 9);
+  });
+
   test("a later reading counts only what was appended", async () => {
     const path = lane("a", 2, 1);
     await tokenReading(c.state, "claude", c.host());

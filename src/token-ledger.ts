@@ -106,7 +106,10 @@ function claudeSpend(line: string): Spend | null {
   };
   // fast mode runs the same model at twice its price
   const speed = get(usage, "speed") === "fast" ? 2 : 1;
-  return { id, t, dollars: speed * cost(tokens, claudePrice(typeof model === "string" ? model : "")) };
+  // the prompt counts every input token, cache reads and writes included
+  const prompt = tokens.input + tokens.cacheRead + tokens.cacheWriteShort + tokens.cacheWriteLong;
+  const price = claudePrice(typeof model === "string" ? model : "", prompt);
+  return { id, t, dollars: speed * cost(tokens, price) };
 }
 
 function codexSpend(line: string, setting: CodexSetting): Spend | null {

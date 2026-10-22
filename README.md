@@ -171,7 +171,9 @@ differently from its price, lanes whose mix differs from the average are measure
 off.
 
 Each request is priced by its own model, at the list prices in `src/token-prices.ts`. A Claude
-message names its model and fast mode doubles it. A Codex usage record names neither, so each
+message names its model and fast mode doubles it. A Claude Haiku 5.5 prompt over 100K tokens
+(input, cache reads and cache writes together) pays five times every rate for the whole
+request; the other current Claude models bill their full context at one rate. A Codex usage record names neither, so each
 rollout's latest `turn_context` and `thread_settings_applied` lines supply its model and
 service tier: Fast (`priority`) costs twice Standard, Ultrafast six times and Flex half. A
 Codex prompt over 272K input tokens is billed at long-context rates (input and cache twice,

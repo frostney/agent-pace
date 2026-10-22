@@ -42,13 +42,31 @@ const CLAUDE_FAMILIES: readonly (readonly [string, string])[] = [
   ["haiku", "claude-haiku-5-5"],
 ];
 
-export function claudePrice(model: string): Price {
-  const listed = CLAUDE_PRICES.get(model);
-  if (listed) {
-    return listed;
-  }
+/**
+ * A model whose request is billed at a multiple of its price when the prompt (input, cache
+ * reads and cache writes) is longer than a threshold: [prompt tokens, factor on every rate].
+ */
+const CLAUDE_LONG_CONTEXT: ReadonlyMap<string, readonly [number, number]> = new Map([
+  ["claude-haiku-5-5", [100_000, 5]],
+]);
+
+/** The price of one Claude request: its model's, at its long-context rate if the prompt has one. */
+export function claudePrice(model: string, prompt: number): Price {
   const family = CLAUDE_FAMILIES.find(([name]) => model.includes(name));
-  return CLAUDE_PRICES.get(family?.[1] ?? "claude-opus-5-5") ?? claude(4, 20, 0.2);
+  const priced = CLAUDE_PRICES.has(model) ? model : (family?.[1] ?? "claude-opus-5-5");
+  const price = CLAUDE_PRICES.get(priced) ?? claude(4, 20, 0.2);
+  const [threshold, factor] = CLAUDE_LONG_CONTEXT.get(priced) ?? [Number.POSITIVE_INFINITY, 1];
+  return prompt > threshold ? scaled(price, factor, factor) : price;
+}
+
+function scaled(price: Price, input: number, output: number): Price {
+  return {
+    input: price.input * input,
+    output: price.output * output,
+    cacheRead: price.cacheRead * input,
+    cacheWriteShort: price.cacheWriteShort * input,
+    cacheWriteLong: price.cacheWriteLong * input,
+  };
 }
 
 /**
@@ -96,16 +114,7 @@ export function codexPrice(model: string, prompt: number): Price {
   const family = CODEX_FAMILIES.find(([name]) => base.split("-").includes(name));
   const price =
     CODEX_PRICES.get(base) ?? CODEX_PRICES.get(family?.[1] ?? "gpt-6.1-sol") ?? openai(2, 10, 0.1);
-  if (prompt <= OPENAI_SHORT_CONTEXT) {
-    return price;
-  }
-  return {
-    input: price.input * 2,
-    output: price.output * 1.5,
-    cacheRead: price.cacheRead * 2,
-    cacheWriteShort: price.cacheWriteShort * 2,
-    cacheWriteLong: price.cacheWriteLong * 2,
-  };
+  return prompt > OPENAI_SHORT_CONTEXT ? scaled(price, 2, 1.5) : price;
 }
 
 /** What a Codex service tier costs against Standard: Fast is twice it, Ultrafast six times. */
