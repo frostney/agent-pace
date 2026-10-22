@@ -4,7 +4,7 @@ import { assess, laneSummary } from "./assess.ts";
 import { ExitError, OsError, RateLimited, survivableErrorText } from "./errors.ts";
 import { commandLine, defaultStateDirectory, type Host, systemHost } from "./host.ts";
 import { runPlan } from "./plan.ts";
-import { parseIntText } from "./python-format.ts";
+import { parseIntText, stringRepr } from "./python-format.ts";
 import { dumps } from "./python-json.ts";
 import { readSource } from "./readings.ts";
 import { noteLines, render, rollovers, sourceJson, Wording } from "./report.ts";
@@ -18,7 +18,7 @@ function notify(command: string, text: string, host: Host): void {
   const [name, ...args] = words.length > 0 ? [...words, text] : [text];
   const line = name === undefined ? null : commandLine(name, args, host);
   if (line === null) {
-    throw new OsError(`[Errno 2] No such file or directory: '${name ?? ""}'`);
+    throw new OsError(`[Errno 2] No such file or directory: ${stringRepr(name ?? "")}`);
   }
   const result = Bun.spawnSync(line.cmd, {
     ...line.options,

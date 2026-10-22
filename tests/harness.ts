@@ -23,7 +23,7 @@ import type { Host } from "../src/host.ts";
 import { isoUtc } from "../src/time-format.ts";
 
 export const NOW = 1761132357;
-/** The 7d window's natural reset, 27 Oct 07:14 UTC. */
+/** The 7d window's natural reset, 28 Oct 07:14 UTC. */
 export const RESET = 1761635664;
 
 export type Fields = Record<string, unknown>;

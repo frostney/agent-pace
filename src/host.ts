@@ -1,6 +1,7 @@
 import { writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isatty } from "node:tty";
 
 /** What agent-pace takes from the machine it runs on; tests pass their own. */
 export interface Host {
@@ -22,24 +23,40 @@ export interface Host {
   sleep(seconds: number): Promise<void>;
 }
 
+/**
+ * Writes all of text to fd, waiting while a reader is behind, as Python's blocking write did.
+ * A descriptor a parent left non-blocking answers EAGAIN or takes part of the text.
+ */
+function writeAll(fd: number, text: string): void {
+  const bytes = Buffer.from(text);
+  let offset = 0;
+  while (offset < bytes.length) {
+    try {
+      offset += writeSync(fd, bytes, offset);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EAGAIN") {
+        throw error;
+      }
+      Bun.sleepSync(10);
+    }
+  }
+}
+
 export function systemHost(): Host {
   return {
     env: process.env,
     platform: process.platform,
     timeZone: undefined,
-    terminalColumns: process.stdout.isTTY ? process.stdout.columns : undefined,
+    // only a terminal's columns: touching process.stdout on a pipe makes Bun set it non-blocking
+    terminalColumns: isatty(1) ? process.stdout.columns : undefined,
     appServerTimeoutS: 20,
     now: () => Date.now() / 1000,
     monotonic: () => performance.now() / 1000,
     fetch: (url, init) => fetch(url, init),
     // Written at once, as Python's print with flush=True: a closed pipe is an error the
     // watch loop reports ("Broken pipe"), not output dropped while alerts go on.
-    stdout: (text) => {
-      writeSync(1, text);
-    },
-    stderr: (text) => {
-      writeSync(2, text);
-    },
+    stdout: (text) => writeAll(1, text),
+    stderr: (text) => writeAll(2, text),
     sleep: (seconds) => {
       if (!(seconds >= 0)) {
         throw new RangeError("sleep length must be non-negative"); // Python's time.sleep
