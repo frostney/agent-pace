@@ -173,6 +173,58 @@ describe("TokenLedger", () => {
     expect((await ledger()).spent(NOW - 3600, NOW)).toBeCloseTo(2, 9);
   });
 
+  test("on a first reading a fork's copies go to the session that wrote them", async () => {
+    const original = lane("a", 3, 1);
+    const fork = join(c.dir, "claude-home/projects/proj/0-fork.jsonl"); // listed before the original
+    writeFileSync(fork, readFileSync(original, "utf8"));
+    utimesSync(fork, NOW - 30, NOW - 30);
+    utimesSync(original, NOW - 90, NOW - 90);
+    const use = await ledger();
+    expect(use.byLane(NOW - 3600, NOW).get("proj/a.jsonl")?.dollars).toBeCloseTo(3, 9);
+    expect(use.byLane(NOW - 3600, NOW).has("proj/0-fork.jsonl")).toBe(false);
+  });
+
+  test("a deleted session's recent costs stay for the fit", async () => {
+    const gone = lane("a", 3, 1);
+    lane("b", 1, 1);
+    await ledger();
+    rmSync(gone);
+    expect((await ledger()).spent(NOW - 3600, NOW)).toBeCloseTo(4, 9);
+  });
+
+  test("a linked directory is not entered", async () => {
+    lane("a", 2, 1);
+    symlinkSync("..", join(c.dir, "claude-home/projects/proj/up"));
+    const use = await ledger();
+    expect([...use.byLane(NOW - 3600, NOW).keys()]).toEqual(["proj/a.jsonl"]);
+  });
+
+  test("a request older than the ledger keeps is not counted", async () => {
+    c.claudeSpending("a", [
+      { t: M - 9 * 86400, id: "old", model: "claude-opus-5-5", usage: opusOutput(5) },
+      { t: M - 60, id: "new", model: "claude-opus-5-5", usage: opusOutput(1) },
+    ]);
+    expect((await ledger()).spent(0, NOW)).toBeCloseTo(1, 9);
+  });
+
+  test("fast mode costs twice as much", async () => {
+    c.claudeSpending("a", [
+      { t: M - 60, id: "f", model: "claude-opus-5-5", usage: { ...opusOutput(1), speed: "fast" } },
+    ]);
+    expect((await ledger()).spent(NOW - 3600, NOW)).toBeCloseTo(2, 9);
+  });
+
+  test("a file rewritten with new content counts the new requests", async () => {
+    const path = lane("a", 3, 1);
+    await ledger();
+    writeFileSync(
+      path,
+      `${compact({ type: "assistant", timestamp: iso(M - 60), message: { id: "fresh", model: "claude-opus-5-5", usage: opusOutput(4) } })}\n`,
+    );
+    utimesSync(path, NOW - 60, NOW - 60);
+    expect((await ledger()).spent(NOW - 3600, NOW)).toBeCloseTo(7, 9);
+  });
+
   test("a lane that aged out is dropped and the others keep their costs", async () => {
     const old = lane("a", 2, 1);
     await ledger();
@@ -189,6 +241,34 @@ describe("TokenLedger", () => {
     ]);
     const kept = JSON.parse(readFileSync(join(c.state, "tokens-claude.json"), "utf8"));
     expect(kept.lanes).toEqual(["proj/b.jsonl"]);
+  });
+
+  test("after a lane ages out, a later line of another lane's request still goes to that lane", async () => {
+    const later = NOW + 9 * 86400;
+    const old = lane("a", 1, 1);
+    const at = (name: string, id: string, dollars: number) =>
+      c.claudeSpending(
+        name,
+        [{ t: later - 120, id, model: "claude-opus-5-5", usage: opusOutput(dollars) }],
+        later - 60,
+      );
+    const b = at("b", "b1", 1);
+    at("c", "c1", 1);
+    await ledger(); // lanes a, b, c
+    rmSync(old);
+    c.clock = later;
+    await ledger(); // a ages out: b and c are renumbered
+    appendFileSync(
+      b,
+      `${compact({ type: "assistant", timestamp: iso(later - 120), message: { id: "b1", model: "claude-opus-5-5", usage: opusOutput(3) } })}\n`,
+    );
+    utimesSync(b, later - 30, later - 30);
+    const use = await ledger();
+    const lanes = [...use.byLane(later - 3600, later)].map(([name, { dollars }]) => [name, dollars]);
+    expect(lanes.sort()).toEqual([
+      ["proj/b.jsonl", 3],
+      ["proj/c.jsonl", 1],
+    ]);
   });
 
   test("codex responses are priced from their usage records", async () => {
@@ -302,6 +382,79 @@ describe("TokenCost", () => {
     expect(fitTokenCost(lastWeek, use)?.pointsPerDollar).toBeCloseTo(6 / 60, 9);
   });
 
+  test("many equal runs all teach the fit", async () => {
+    const runs = 30;
+    c.claudeSpending(
+      "a",
+      Array.from({ length: runs * 10 }, (_, i) => ({
+        t: M - 7 * 86400 + 1800 * Math.floor(i / 10) + 60 * (i % 10),
+        id: `r${i}`,
+        model: "claude-opus-5-5",
+        usage: opusOutput(1),
+      })),
+    );
+    const use = await ledger();
+    const rows = Array.from({ length: runs }, (_, k) => {
+      const t0 = NOW - 7 * 86400 + 1800 * k - 60;
+      const reset = R5 - 18000 * (runs - k);
+      return [[t0, 0, reset] as const, [t0 + 600, 10, reset] as const];
+    }).flat();
+    expect(fitTokenCost(rows, use)).toEqual({
+      pointsPerDollar: 1,
+      runs,
+      points: 10 * runs,
+      dollars: 10 * runs,
+    });
+  });
+
+  test("a run shorter than nine minutes, or across a drop in use, teaches nothing", async () => {
+    lane("a", 60, 1);
+    const use = await ledger();
+    expect(
+      fitTokenCost(
+        [
+          [NOW - 300, 0, R5],
+          [NOW, 10, R5],
+        ],
+        use,
+      ),
+    ).toBeNull();
+    // the window fell from 50 to 10 without its reset moving: only the stretch after the fall counts
+    expect(
+      fitTokenCost(
+        [
+          [NOW - 3660, 50, R5],
+          [NOW - 1800, 10, R5],
+          [NOW, 20, R5],
+        ],
+        use,
+      ),
+    ).toEqual({ pointsPerDollar: 10 / 29, runs: 1, points: 10, dollars: 29 }); // the 29 minutes after the fall
+  });
+
+  test("a run that began before the ledger knew every lane is left out", async () => {
+    c.claudeSpending(
+      "a",
+      Array.from({ length: 30 }, (_, i) => ({
+        t: M - 8 * 86400 - 900 + 60 * i,
+        id: `e${i}`,
+        model: "claude-opus-5-5",
+        usage: opusOutput(1),
+      })),
+    );
+    const use = await ledger();
+    // its start predates the eight days the ledger keeps, so the costs it knows of it are partial
+    expect(
+      fitTokenCost(
+        [
+          [NOW - 8 * 86400 - 960, 0, R5 - 7 * 18000],
+          [NOW - 8 * 86400 + 900, 10, R5 - 7 * 18000],
+        ],
+        use,
+      ),
+    ).toBeNull();
+  });
+
   test("each lane burns at its own rate", async () => {
     lane("a", 60, 1);
     lane("b", 60, 0.5);
@@ -396,6 +549,13 @@ describe("TokenLanes", () => {
       [Math.round(rate * 100) / 100],
     ]);
     expect(five.lane_headroom).toBe(Math.floor(((97 - 2) / ((R5 - NOW) / 3600) - rate) / rate));
+  });
+
+  test("a lane that has just started is averaged over five minutes, not one", async () => {
+    c.claudeSpending("new", [{ t: M - 60, id: "n1", model: "claude-opus-5-5", usage: opusOutput(1) }]);
+    const use = await ledger();
+    const fit = { pointsPerDollar: 0.2, runs: 1, points: 20, dollars: 100 };
+    expect(laneRates(use, fit, NOW)).toEqual([(1 * 0.2) / (300 / 3600)]);
   });
 
   test("a lane that spent nothing lately is not counted as burning", async () => {

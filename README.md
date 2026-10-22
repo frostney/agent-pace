@@ -161,9 +161,9 @@ difference of whole points and so can be a point off; over n runs the sum can be
 The fit counts once Σ Δu is at least 3 points per run, which keeps that error within a third,
 the bar a recent rate has to clear.
 
-A run in which the local lanes spent less than a twentieth of what they spent over all the runs
-says little about what a local lane costs and is left out: another machine, or claude.ai,
-moved the window then. Use from elsewhere during a run
+A run whose local lanes spent less than a twentieth of what a point usually costs them (the
+median over the runs) says little about what a local lane costs and is left out: another
+machine, or claude.ai, moved the window then. Use from elsewhere during a run
 is counted against the local lanes, as the shared-out estimate counts it, so a busy other
 machine makes local lanes look more expensive than they are, never cheaper. List prices are
 ratios, not the subscription's own accounting: if a window weighs a kind of token or a model

@@ -23,8 +23,11 @@ import type { TokenUse } from "./token-ledger.ts";
 export const LANE_RATE_SPAN_S = 1800;
 /** A lane that has spent for less than this is averaged over this much. */
 const MIN_LANE_SPAN_S = 300;
-/** A run whose local spending is less than this share of all the runs' says too little. */
-const MIN_RUN_SHARE = 0.05;
+/**
+ * A run whose local lanes spent less than this share of what a point usually costs them was
+ * moved mostly by something else.
+ */
+const MIN_COST_SHARE = 0.05;
 /** A run shorter than this says little: two readings close together. */
 const MIN_RUN_S = 540;
 
@@ -71,13 +74,22 @@ export function fitTokenCost(rows: readonly HistoryRow[], use: TokenUse): TokenC
     .filter((run) => run.t0 >= use.since)
     .map((run) => ({ ...run, spent: use.spent(run.t0, run.t1) }))
     .filter((run) => run.spent > 0);
-  const total = known.reduce((sum, run) => sum + run.spent, 0);
+  // what a point usually costs the local lanes: the median over the runs that moved
+  const perPoint = known
+    .filter((run) => run.du > 0)
+    .map((run) => run.spent / run.du)
+    .sort((a, b) => a - b);
+  const middle = perPoint.length / 2;
+  const usual =
+    perPoint.length === 0
+      ? 0
+      : ((perPoint[Math.floor(middle - 0.5)] ?? 0) + (perPoint[Math.floor(middle)] ?? 0)) / 2;
   let points = 0;
   let dollars = 0;
   let counted = 0;
   for (const run of known) {
-    if (run.spent < MIN_RUN_SHARE * total) {
-      continue; // the lanes here barely spent: whatever moved the window, it was not them
+    if (run.du > 0 && run.spent / run.du < MIN_COST_SHARE * usual) {
+      continue; // the lanes here barely spent for the points: whatever moved the window, it was not them
     }
     points += run.du;
     dollars += run.spent;

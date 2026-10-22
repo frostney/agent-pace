@@ -12,6 +12,7 @@
 
 import {
   closeSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -135,9 +136,13 @@ function idKey(id: string): string {
   return (hash >> 12n).toString(36);
 }
 
-/** Session files under root (links followed) written since `after`, with their sizes. */
+/**
+ * Session files under root written since `after`, with their sizes, oldest first: on a first
+ * reading a request a fork copied is then counted in the session that wrote it. Links to files
+ * are read; linked directories are not entered, as lane counting does not enter them.
+ */
 function sessionFiles(root: string, after: number, source: Source): Map<string, number> {
-  const out = new Map<string, number>();
+  const found: { path: string; size: number; born: number }[] = [];
   const walk = (dir: string) => {
     let names: string[];
     try {
@@ -148,25 +153,30 @@ function sessionFiles(root: string, after: number, source: Source): Map<string, 
     for (const name of names) {
       const path = join(dir, name);
       let stat: import("node:fs").Stats;
+      let link = false;
       try {
+        link = lstatSync(path).isSymbolicLink();
         stat = statSync(path);
       } catch {
         continue; // gone, or a link to nothing
       }
       if (stat.isDirectory()) {
-        walk(path);
+        if (!link) {
+          walk(path);
+        }
       } else if (
         stat.isFile() &&
         name.endsWith(".jsonl") &&
         (source === "claude" || name.startsWith("rollout-")) &&
         stat.mtimeMs / 1000 >= after
       ) {
-        out.set(path, stat.size);
+        found.push({ path, size: stat.size, born: stat.birthtimeMs || stat.mtimeMs });
       }
     }
   };
   walk(root);
-  return out;
+  found.sort((a, b) => a.born - b.born);
+  return new Map(found.map(({ path, size }) => [path, size]));
 }
 
 /**
@@ -257,7 +267,7 @@ function update(ledger: LedgerFile, source: Source, root: string, now: number): 
         } catch {
           spend = null; // a line agent-pace does not understand costs nothing
         }
-        if (spend === null || spend.t < horizon) {
+        if (spend === null) {
           continue;
         }
         const key = idKey(spend.id);
@@ -297,19 +307,24 @@ function update(ledger: LedgerFile, source: Source, root: string, now: number): 
     .filter(([minute]) => minute >= horizon);
   // keep only the lanes something still refers to, renumbered
   const old = ledger.lanes;
-  const used = new Set([
-    ...kept.map(([, lane]) => old[lane]),
-    ...Object.values(ledger.seen).map(([, lane]) => old[lane]),
-    ...Object.keys(ledger.offsets),
-  ]);
+  // a request's lane always has its bucket, so the buckets and the files name every lane in use
+  const used = new Set([...kept.map(([, lane]) => old[lane]), ...Object.keys(ledger.offsets)]);
   ledger.lanes = old.filter((lane) => used.has(lane));
   const index = new Map(ledger.lanes.map((lane, i) => [lane, i]));
-  const renumber = (lane: number) => index.get(old[lane] ?? "") ?? 0;
+  const renumber = (lane: number) => index.get(old[lane] ?? "");
   ledger.buckets = kept
-    .map(([minute, lane, dollars]): Bucket => [minute, renumber(lane), dollars])
+    .flatMap(([minute, lane, dollars]): Bucket[] => {
+      const now = renumber(lane);
+      return now === undefined ? [] : [[minute, now, dollars]];
+    })
     .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-  for (const seen of Object.values(ledger.seen)) {
-    seen[1] = renumber(seen[1]);
+  for (const [key, seen] of Object.entries(ledger.seen)) {
+    const now = renumber(seen[1]);
+    if (now === undefined) {
+      delete ledger.seen[key];
+    } else {
+      seen[1] = now;
+    }
   }
   ledger.since = Math.max(ledger.since, horizon);
 }
