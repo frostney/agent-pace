@@ -229,6 +229,17 @@ export function windowJson(a: WindowAssessment): JsonObject {
     lane_headroom: a.laneHeadroom,
     lane_binding: a.laneBinding,
     observed_at: a.observedAt,
+    lane_basis: a.laneBasis,
+    lane_rates: a.laneRates === null ? null : a.laneRates.map(float),
+    token_cost:
+      a.tokenCost === null
+        ? null
+        : {
+            points_per_dollar: float(a.tokenCost.pointsPerDollar),
+            runs: a.tokenCost.runs,
+            points: float(a.tokenCost.points),
+            dollars: float(a.tokenCost.dollars),
+          },
   };
 }
 

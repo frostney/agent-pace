@@ -1,4 +1,5 @@
 import type { Json } from "./python-json.ts";
+import type { TokenUse } from "./token-ledger.ts";
 
 export type Source = "claude" | "codex";
 export const SOURCES: readonly Source[] = ["claude", "codex"];
@@ -44,4 +45,6 @@ export interface Reading {
 
 export interface ReadingWithLanes extends Reading {
   readonly lanes: LaneReading;
+  /** What each lane spent lately, from the agents' session files; null without a ledger. */
+  readonly tokens: TokenUse | null;
 }

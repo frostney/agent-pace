@@ -10,7 +10,9 @@
   risk for a tool that only needs Bun's own APIs.
 - Output is a contract. The text lines, the `--json` fields and their types, the help and
   usage errors, and the state files (`~/.local/state/agent-pace/*.csv`, `claude-banked.json`)
-  match what the Python version 1.4 printed and wrote, digit for digit. Number formatting goes
+  match what the Python version 1.4 printed and wrote, digit for digit, apart from the measured
+  per-lane burn (its lane numbers and its `lane_basis`, `lane_rates` and `token_cost` fields)
+  and `tokens-<source>.json`, which the Python version did not have. Number formatting goes
   through `src/python-format.ts` and JSON through `src/python-json.ts`; never use
   `toFixed`, `String(number)` or `JSON.stringify` for output. A change to any of these is a
   breaking change and needs its own release note.
@@ -39,6 +41,9 @@ bun bin/agent-pace.ts --help
 - `src/claude.ts` and `src/codex.ts` read the two sources; `src/readings.ts` shares a Claude
   reading per machine (lock, one-minute cache, sidecar) and records history; `src/lanes.ts`
   counts active lanes; `src/history.ts` owns the CSV files.
+- `src/token-ledger.ts` reads what each lane spent from the session files into
+  `tokens-<source>.json`; `src/token-prices.ts` prices tokens; `src/token-burn.ts` learns
+  points per dollar and gives each lane's burn.
 - `src/assess.ts` turns windows and history into targets, banked-reset advice and lane
   headroom; `src/report.ts` words it as text and JSON; `src/plan.ts` is `agent-pace plan`.
 - `src/host.ts` is everything taken from the machine (clock, env, fetch, output). Tests pass

@@ -198,7 +198,15 @@ export async function runPlan(options: PaceOptions & { readonly json: boolean },
   for (const source of SOURCES) {
     try {
       const reading = await readSource(source, options.state, host);
-      const res = assess(source, reading.windows, options, reading.banked, reading.lanes, host.now());
+      const res = assess(
+        source,
+        reading.windows,
+        options,
+        reading.banked,
+        reading.lanes,
+        host.now(),
+        reading.tokens,
+      );
       read.push({ source, reading, res });
     } catch (error) {
       errors[source] = readError(error);

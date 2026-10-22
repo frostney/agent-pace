@@ -1,7 +1,10 @@
+import { EVIDENCE_ERROR, EVIDENCE_POINTS, USE_STEP } from "./evidence.ts";
 import { type HistoryRow, logPath, RESET_JITTER_S, read } from "./history.ts";
 import { LANE_IDLE_S } from "./lanes.ts";
 import { Float, formatFixed, roundTo, roundToInt } from "./python-format.ts";
 import { isoOrNull, isoUtc } from "./time-format.ts";
+import { fitTokenCost, laneRates, type TokenCost } from "./token-burn.ts";
+import type { TokenUse } from "./token-ledger.ts";
 import type { Banked, Credit, LaneReading, Source, UsageWindow } from "./usage.ts";
 
 export type PlanMode = "fill" | "even";
@@ -43,6 +46,10 @@ export interface LanePlan {
   activeLanes: number;
   perLaneRate: number | null;
   laneHeadroom: number | null;
+  /** How the per-lane burn was found: each lane's own tokens, or the window's burn shared out. */
+  laneBasis: "tokens" | "shared" | null;
+  /** With the tokens basis, each spending lane's burn (%/h), highest first. */
+  laneRates: number[] | null;
 }
 
 /** One window's assessment; --json reports it field for field. */
@@ -64,6 +71,8 @@ export interface WindowAssessment extends LanePlan {
   readonly banked: BankAdvice | null;
   laneBinding: boolean;
   readonly observedAt: string;
+  /** Points of this window a dollar of local spending has been worth; null while unlearned. */
+  readonly tokenCost: TokenCost | null;
 }
 
 const sameWindow = (rows: readonly HistoryRow[], w: UsageWindow) =>
@@ -150,12 +159,6 @@ function peakRate(
   return seen.length > 0 ? Math.max(...seen) : null;
 }
 
-/** Both providers report usage in whole points, so a reading can be up to a point off. */
-const USE_STEP = 1;
-/** The most a recent rate may be off by, as a share of it, to count. */
-const EVIDENCE_ERROR = 1 / 3;
-/** A move this large keeps a point's error within that share. */
-const EVIDENCE_POINTS = USE_STEP / EVIDENCE_ERROR;
 /** Of the window's length: a stretch this long bounds the burn even if use barely moved. */
 const EVIDENCE_SPAN = 0.2;
 /** The share of the stretch the lane counts must cover to share the burn out. */
@@ -301,11 +304,31 @@ function lanePlan(
   horizonH: number,
   recent: RecentRate,
   lanes: LaneReading | null,
+  measured: readonly number[] | null,
 ): LanePlan {
   const active = lanes ? lanes.active : 0;
-  const out: LanePlan = { activeLanes: active, perLaneRate: null, laneHeadroom: null };
+  const out: LanePlan = {
+    activeLanes: active,
+    perLaneRate: null,
+    laneHeadroom: null,
+    laneBasis: null,
+    laneRates: null,
+  };
   if (aim - w.used <= 0) {
     out.laneHeadroom = 0; // already at the aim: nothing to add, estimate or not
+    return out;
+  }
+  if (measured && measured.length > 0) {
+    // each lane at its own burn; a new lane is taken to burn as the running ones do on average
+    const total = measured.reduce((sum, r) => sum + r, 0);
+    const mean = total / measured.length;
+    out.laneBasis = "tokens";
+    out.laneRates = measured.map((r) => roundTo(r, 2));
+    if (horizonH <= 0.05 || !(mean > 0)) {
+      return out;
+    }
+    out.perLaneRate = roundTo(mean, 2);
+    out.laneHeadroom = Math.max(0, Math.floor(((aim - w.used) / horizonH - total) / mean));
     return out;
   }
   const [rate, since, until] = recent;
@@ -325,6 +348,7 @@ function lanePlan(
     return out; // the lanes over that stretch are not known: the burn cannot be shared out
   }
   const per = rate / mean;
+  out.laneBasis = "shared";
   out.perLaneRate = roundTo(per, 2);
   out.laneHeadroom = Math.max(0, Math.floor((aim - w.used) / (per * horizonH) - active));
   return out;
@@ -489,6 +513,7 @@ export function assess(
   banked: Banked | null,
   lanes: LaneReading | null,
   now: number,
+  tokens: TokenUse | null = null,
 ): WindowAssessment[] {
   const out: WindowAssessment[] = [];
   const roomy = new Set<string>();
@@ -578,11 +603,15 @@ export function assess(
     // the aim is the target (100% with a reset banked); a window paced through another's cap makes the rest last to 100%
     const aim = goal === null ? 100 : goal;
     const horizon = bank?.deadline ? bank.hoursToDeadline : leftH;
-    const lane = lanePlan(w, aim, horizon, recentRate(r, w, now), lanes);
+    const tokenCost = tokens ? fitTokenCost(r, tokens, now) : null;
+    const measured = tokens && tokenCost ? laneRates(tokens, tokenCost, now) : null;
+    const lane = lanePlan(w, aim, horizon, recentRate(r, w, now), lanes, measured);
     if (redeeming(bank)) {
       // redeem first: the lanes the window takes afterwards are another question
       lane.perLaneRate = null;
       lane.laneHeadroom = null;
+      lane.laneBasis = null;
+      lane.laneRates = null;
     } else if (bank && bank.action === "wait") {
       lane.laneHeadroom = 0; // full until it resets on its own
     } else if (lane.laneHeadroom === null && !bank && projected !== null && projected > 100) {
@@ -606,6 +635,7 @@ export function assess(
       ...lane,
       laneBinding: false,
       observedAt: isoUtc(w.observedAt),
+      tokenCost,
     });
     if (farBelow(w, aim, horizon, now)) {
       roomy.add(w.name);
