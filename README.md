@@ -101,8 +101,20 @@ where the window has room):
   (default `~/.claude/projects`) whose last assistant message is under 10 minutes old; Codex
   rollout files under `$CODEX_HOME/sessions` written in the last 10 minutes. Only mtimes and one
   tail read per fresh file.
-- **Per-lane burn:** the recent rate of the window (not the window average) divided by the
-  lanes active over the stretch it was measured on.
+- **Per-lane burn, measured:** each lane's own tokens. Claude Code records a `usage` block on
+  each assistant message, and Codex a `token_usage_record` per response. agent-pace prices each
+  request at API list prices, which captures how much each kind of token (input, output, cache
+  read, cache write) and each model costs relative to the others. It then learns from its own
+  history how many window points a dollar of that is worth, separately for each window (see
+  [Points per dollar](#points-per-dollar)). A lane's burn is its spending over the last 30
+  minutes, or since it started if that is later, times points per dollar. The lanes counted
+  are those that spent something in the last 10 minutes, which can be fewer than
+  `active_lanes`: a session with a recent message that cost nothing is open, not working. Each
+  request is counted once, at its final cost, in the session that first wrote it, so a forked
+  or resumed session's copied history is not counted again.
+- **Per-lane burn, shared out:** while points per dollar are not learned yet, the recent rate
+  of the window (not the window average) is divided by the lanes active over the stretch it
+  was measured on.
 - **Evidence:** usage comes in whole points, so a reading can be a point off and two readings
   ten minutes apart say little (0% -> 2% is anything from 6 to 18%/h). A rate counts once it is
   known to within a third. When use steps up between two readings it crossed a whole point in
@@ -122,7 +134,8 @@ where the window has room):
   Time no count covers is left out; with less than half the stretch covered there is no
   estimate.
 - **Lanes supported** = (aim - used) / (per-lane burn * hours), less the lanes already running,
-  rounded down, not below 0. The aim is the target (100% with a reset banked; 100% for a window
+  rounded down, not below 0. Measured, the lanes running burn what they each burn and a new lane
+  is taken to burn their average: ((aim - used) / hours - their total) / their average. The aim is the target (100% with a reset banked; 100% for a window
   paced through the other's cap). The hours run to the window's reset, or to the deadline a
   banked reset sets. The window with the least room binds (the longer one on a tie).
 - **Measuring:** without an estimate, or with no active lanes, it says "measuring" and suggests
@@ -133,7 +146,41 @@ where the window has room):
   reset has no room either.
 
 `--json` adds `active_lanes`, `per_lane_rate`, `lane_headroom` and `lane_binding` (the window
-whose headroom the source reports) to each window, and a `lanes` summary.
+whose headroom the source reports) to each window, and a `lanes` summary. `lane_basis` says
+how the per-lane burn was found (`tokens`, `shared`, or null without one), `lane_rates` lists
+each measured lane's burn, highest first, and `token_cost` gives the learned
+`points_per_dollar` with the `runs`, `points` and `dollars` it was learned from.
+
+### Points per dollar
+
+The readings of one window, between resets and cut at any drop in use, make runs. A run from
+its first reading to its last moved Δu whole points while the local lanes spent D dollars, so
+a window's points per dollar are Σ Δu / Σ D over the runs the ledger covers (eight days, so
+the week that just ended keeps teaching the 7d window for a day into the next). Each run's Δu is a
+difference of whole points and so can be a point off; over n runs the sum can be n points off.
+The fit counts once Σ Δu is at least 3 points per run, which keeps that error within a third,
+the bar a recent rate has to clear.
+
+A run whose local lanes spent less than a twentieth of what a point usually costs them (the
+median over the runs) says little about what a local lane costs and is left out: another
+machine, or claude.ai, moved the window then. Use from elsewhere during a run
+is counted against the local lanes, as the shared-out estimate counts it, so a busy other
+machine makes local lanes look more expensive than they are, never cheaper. List prices are
+ratios, not the subscription's own accounting: if a window weighs a kind of token or a model
+differently from its price, lanes whose mix differs from the average are measured that much
+off.
+
+Each request is priced by its own model, at the list prices in `src/token-prices.ts`. A Claude
+message names its model and fast mode doubles it. A Claude Haiku 5.5 prompt over 100K tokens
+(input, cache reads and cache writes together) pays five times every rate for the whole
+request; the other current Claude models bill their full context at one rate. A Codex usage record names neither, so each
+rollout's latest `turn_context` and `thread_settings_applied` lines supply its model and
+service tier: Fast (`priority`) costs twice Standard, Ultrafast six times and Flex half. A
+Codex prompt over 272K input tokens is billed at long-context rates (input and cache twice,
+output one and a half times), and its cache writes at the default 30-minute rate. A rollout
+written before Codex recorded its tier is priced at Standard. A model the tables do not list
+is priced as the current model of its family (Claude) or tier name (Codex `sol`, `astra`,
+`terra`, `luna`), and otherwise as Opus 5.5 or GPT-6.1 Sol.
 
 ### plan
 
@@ -160,8 +207,11 @@ more lanes each provider supports. It changes nothing.
 
 agent-pace keeps its history in `~/.local/state/agent-pace/`: one CSV per source and window
 (`claude-5h.csv`, `codex-7d.csv`: observed at, used, resets at), the lane counts
-(`lanes-<source>.csv`), and the Claude banked resets from the last reading
-(`claude-banked.json`). Claude readings are shared per machine through a lock and a one-minute
+(`lanes-<source>.csv`), the Claude banked resets from the last reading
+(`claude-banked.json`), and what each lane spent per minute over the last eight days with how far
+each session file has been read (`tokens-<source>.json`). The first reading reads the last
+eight days of session files, a few seconds for a busy week; later readings read only what was
+appended. Claude readings are shared per machine through a lock and a one-minute
 cache, so run one watcher rather than one per agent.
 
 ## Credentials and the endpoints it reads
@@ -188,7 +238,9 @@ always terminated); the fallback snapshots come from `$CODEX_HOME/sessions` (def
 
 agent-pace 1.4 was a Python script. This TypeScript version prints the same text and `--json`
 digit for digit, takes the same flags, and reads and writes the same state files, so a history
-the Python version kept carries over. Where they differ:
+the Python version kept carries over. Two things are new: the measured per-lane burn, which
+changes the lane numbers once points per dollar are learned, and the `--json` fields that
+describe it. Otherwise they differ only here:
 - Failures the operating system reports use urllib's and OSError's frames (`<urlopen error
   ...>`, `[Errno 2] No such file or directory: ...`); a refused connection and an unknown host
   read as Python's did, other failures carry Bun's wording.

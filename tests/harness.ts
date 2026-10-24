@@ -288,6 +288,31 @@ export class Case {
     }
   }
 
+  /**
+   * A Claude Code session file whose assistant messages carry usage, as Claude Code writes them:
+   * each message on two lines (a thinking and a text block) with the same id and usage.
+   */
+  claudeSpending(
+    lane: string,
+    messages: readonly { t: number; id: string; model: string; usage: Fields }[],
+    mtime = NOW - 60,
+  ): string {
+    mkdirSync(join(this.dir, "claude-home/projects/proj"), { recursive: true });
+    const path = join(this.dir, "claude-home/projects/proj", `${lane}.jsonl`);
+    const lines = messages.flatMap(({ t, id, model, usage }) =>
+      ["thinking", "text"].map((block) =>
+        compact({
+          type: "assistant",
+          timestamp: iso(t),
+          message: { id, model, usage, content: [{ type: block }] },
+        }),
+      ),
+    );
+    writeFileSync(path, lines.map((line) => `${line}\n`).join(""));
+    utimesSync(path, mtime, mtime);
+    return path;
+  }
+
   /** Earlier lane counts (time, active lanes) as the lane history file holds them. */
   laneHistory(source: string, points: readonly (readonly [number, number])[]): void {
     writeFileSync(

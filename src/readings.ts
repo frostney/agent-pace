@@ -7,6 +7,7 @@ import { logPath, read, record } from "./history.ts";
 import type { Host } from "./host.ts";
 import { laneReading } from "./lanes.ts";
 import { dumps, float, isRecord, type Json } from "./python-json.ts";
+import { tokenReading } from "./token-ledger.ts";
 import type { Banked, Credit, Reading, ReadingWithLanes, Source, UsageWindow } from "./usage.ts";
 
 /** The banked resets as the sidecar file holds them (Python's json.dump of the same dict). */
@@ -122,7 +123,11 @@ async function fetchShared(
 
 async function readClaude(state: string, host: Host): Promise<ReadingWithLanes> {
   const reading = await fetchShared(state, "claude", () => claudeReading(state, host), host);
-  return { ...reading, lanes: await laneReading(state, "claude", host) };
+  return {
+    ...reading,
+    lanes: await laneReading(state, "claude", host),
+    tokens: await tokenReading(state, "claude", host),
+  };
 }
 
 async function readCodex(state: string, host: Host): Promise<ReadingWithLanes> {
@@ -137,7 +142,14 @@ async function readCodex(state: string, host: Host): Promise<ReadingWithLanes> {
         ? "banked resets unknown (Codex app server unavailable; read the session logs)"
         : "banked resets unknown (the Codex app server reported none)";
   }
-  return { windows, banked, note, via, lanes: await laneReading(state, "codex", host) };
+  return {
+    windows,
+    banked,
+    note,
+    via,
+    lanes: await laneReading(state, "codex", host),
+    tokens: await tokenReading(state, "codex", host),
+  };
 }
 
 export function readSource(source: Source, state: string, host: Host): Promise<ReadingWithLanes> {

@@ -38,7 +38,15 @@ async function pace(source: Source, options: Options, host: Host): Promise<numbe
     try {
       const reading = await readSource(source, options.state, host);
       const now = host.now();
-      const res = assess(source, reading.windows, options, reading.banked, reading.lanes, now);
+      const res = assess(
+        source,
+        reading.windows,
+        options,
+        reading.banked,
+        reading.lanes,
+        now,
+        reading.tokens,
+      );
       let messages = rollovers(source, res, seen);
       if (first) {
         messages = []; // only announce resets that happen while watching
