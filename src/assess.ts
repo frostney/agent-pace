@@ -157,7 +157,7 @@ function costRatio(shortRows: readonly HistoryRow[], longRows: readonly HistoryR
   return ds >= 5 ? dl / ds : null;
 }
 
-/** The fastest burn seen in this window (%/h): over spans of an hour or more, and its average so far. */
+/** The fastest burn seen in this window (%/h): the rate now, its average so far, and over spans of an hour or more. */
 function peakRate(
   rows: readonly HistoryRow[],
   w: UsageWindow,
@@ -380,7 +380,7 @@ function lanePlan(
   }
   const counted = newH > 0.05 && burn.each > 0;
   if (burn.rates !== null || counted) {
-    out.laneBasis = burn.basis; // each lane's own burn is known even where no headroom is counted
+    out.laneBasis = burn.basis; // each lane's own burn is reported even where no headroom is counted
   }
   if (burn.rates !== null) {
     out.laneRates = burn.rates.map((r) => roundTo(r, 2));
