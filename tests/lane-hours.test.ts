@@ -97,6 +97,20 @@ describe("LaneHours", () => {
     expect((data.lanes as Fields).headroom).toBe(7);
   });
 
+  test("a window waiting for its own reset gives no lane hours", async () => {
+    // at the limit with nothing expiring first and the reset an hour off: keep the banked reset
+    const reset = NOW + 3600;
+    c.serve(response({ used: 98, reset }));
+    const since = NOW - (3 / 0.6) * 3600;
+    c.history("codex", "7d", [[since, 95]], reset);
+    c.laneHistory("codex", every(300, since, NOW, 2));
+    c.codexLanes(2);
+    const data = await c.json("codex");
+    const w = windows(data)[0] as Fields;
+    expect([(w.banked as Fields).action, w.lane_headroom, w.lane_hours]).toEqual(["wait", 0, null]);
+    expect((data.lanes as Fields).hours).toBeNull();
+  });
+
   test("a week whose lane burn is only shared out keeps its window average", async () => {
     // a week at 88% with 62.9h left, 0.8%/h on average: the recent rate of a week's whole points
     // swings from reading to reading, so only the lanes' own tokens pace it (tests/tokens.test.ts)

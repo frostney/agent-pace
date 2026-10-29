@@ -649,6 +649,22 @@ describe("TokenLanes", () => {
     expect(out).not.toContain("slow down");
   });
 
+  test("a banked reset is judged by a peak no lower than the lanes' burn now", async () => {
+    // the week at 88% moved 3 points in 23 hours, all while lane a spent the last half hour: it
+    // burns about 6%/h now, against 0.8%/h on average; a reset expires in 8h (fill by 6h)
+    const weekReset = Math.trunc(NOW + 62.9 * 3600);
+    c.claude.seven_day = { utilization: 88, resets_at: iso(weekReset) };
+    c.history("claude", "7d", [[NOW - 23 * 3600, 85]], weekReset);
+    lane("a", 30, 10);
+    c.grant({ ends_at: iso(NOW + 8 * 3600).replace("Z", "+00:00") });
+    const week = ((await c.json("claude")).windows as Fields[])[1] as Fields;
+    const bank = week.banked as Fields;
+    expect(week.rate_basis).toBe("lanes");
+    expect(bank.peak_rate as number).toBeGreaterThanOrEqual(bank.rate_now as number);
+    // at the 0.8%/h average it would end near 93%: redeem anyway; the lanes fill it in time
+    expect(bank.action).toBe("fill");
+  });
+
   test("without a learned cost the lanes are shared out as before", async () => {
     (c.claude.five_hour as Fields).utilization = 30;
     lane("a", 60, 1);

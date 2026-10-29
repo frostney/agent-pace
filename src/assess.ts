@@ -161,12 +161,10 @@ function costRatio(shortRows: readonly HistoryRow[], longRows: readonly HistoryR
 function peakRate(
   rows: readonly HistoryRow[],
   w: UsageWindow,
-  now: number,
+  average: number | null,
   rate: number | null,
 ): number | null {
-  const start = w.resetsAt - w.lengthS;
   const seen = rate === null ? [] : [rate];
-  const average = windowAverage(w, now);
   if (average !== null) {
     seen.push(average);
   }
@@ -380,14 +378,16 @@ function lanePlan(
   if (burn === null) {
     return out;
   }
+  const counted = newH > 0.05 && burn.each > 0;
+  if (burn.rates !== null || counted) {
+    out.laneBasis = burn.basis; // each lane's own burn is known even where no headroom is counted
+  }
   if (burn.rates !== null) {
-    out.laneBasis = burn.basis;
     out.laneRates = burn.rates.map((r) => roundTo(r, 2));
   }
-  if (newH <= 0.05 || !(burn.each > 0)) {
+  if (!counted) {
     return out;
   }
-  out.laneBasis = burn.basis;
   out.perLaneRate = roundTo(burn.each, 2);
   out.laneHours = roundTo(newH, 2);
   out.laneHeadroom = Math.max(0, Math.floor((aim - w.used - burn.total * runningH) / (burn.each * newH)));
@@ -605,8 +605,7 @@ export function assess(
     const bank = bankPlan(
       w,
       estimate,
-      // the peak is over spans of an hour or more: not a lane's last half hour of tokens
-      peakRate(r, w, now, basis === "lanes" ? null : estimate),
+      peakRate(r, w, average, estimate),
       banks.get(w.name) ?? null,
       options,
       now,
