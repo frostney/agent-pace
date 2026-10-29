@@ -1,7 +1,7 @@
 {
   "name": "agent-pace",
   "private": true,
-  "version": "1.4.0",
+  "version": "2.0.0",
   "description": "Pace AI coding-agent work against Claude Code and Codex usage windows, banked resets and lane headroom.",
   "license": "MIT",
   "author": "Johannes Stein",

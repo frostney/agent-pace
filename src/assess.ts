@@ -18,6 +18,8 @@ export interface PaceOptions {
   readonly plan: PlanMode;
   readonly reserve: number;
   readonly redeemMargin: number;
+  /** The hours a new lane is judged over before the next reading. */
+  readonly laneHours: number;
   readonly state: string;
 }
 
@@ -50,6 +52,8 @@ export interface LanePlan {
   laneBasis: "tokens" | "shared" | null;
   /** With the tokens basis, each spending lane's burn (%/h), highest first. */
   laneRates: number[] | null;
+  /** The hours the headroom gives each new lane before the next reading; null without headroom. */
+  laneHours: number | null;
 }
 
 /** One window's assessment; --json reports it field for field. */
@@ -60,6 +64,8 @@ export interface WindowAssessment extends LanePlan {
   readonly hoursLeft: number;
   readonly ratePerHour: number | null;
   readonly rateBasis: RateBasis | null;
+  /** used / hours elapsed, after the window's first hour. */
+  readonly windowAverageRate: number | null;
   readonly projectedAtReset: number | null;
   /** --target is a float, a capped or banked target an int: Python printed them differently. */
   readonly target: number | Float | null;
@@ -89,13 +95,27 @@ function maxBy<T>(items: readonly T[], key: (item: T) => number): T | undefined 
   return best;
 }
 
-function rateOf(rows: readonly HistoryRow[], w: UsageWindow, now: number): [number | null, RateBasis | null] {
+/** The window's average burn so far (%/h), after its first hour. */
+function windowAverage(w: UsageWindow, now: number): number | null {
   const start = w.resetsAt - w.lengthS;
+  return now - start > 3600 ? w.used / ((now - start) / 3600) : null;
+}
+
+function rateOf(
+  w: UsageWindow,
+  recent: RecentRate,
+  average: number | null,
+  burn: LaneBurn | null,
+): [number | null, RateBasis | null] {
   if (w.lengthS >= 86400) {
-    // a week is bursty: pace it by its average so far, not the last minutes
-    return now - start > 3600 ? [w.used / ((now - start) / 3600), "window-average"] : [null, null];
+    // a week is bursty: pace it by what the lanes running now spend (their tokens, each over half
+    // an hour), or failing that its average so far, not by the window's last minutes
+    if (burn !== null && burn.basis === "tokens" && burn.each > 0) {
+      return [burn.total, "lanes"];
+    }
+    return average === null ? [null, null] : [average, "window-average"];
   }
-  const [rate, , , basis] = recentRate(rows, w, now); // held to the same evidence as the lane estimate
+  const [rate, , , basis] = recent; // held to the same evidence as the lane estimate
   // no window-average fallback for short windows: right after a reset it is only the start-up burst
   return [rate, basis];
 }
@@ -137,17 +157,16 @@ function costRatio(shortRows: readonly HistoryRow[], longRows: readonly HistoryR
   return ds >= 5 ? dl / ds : null;
 }
 
-/** The fastest burn seen in this window (%/h): over spans of an hour or more, and its average so far. */
+/** The fastest burn seen in this window (%/h): the rate now, its average so far, and over spans of an hour or more. */
 function peakRate(
   rows: readonly HistoryRow[],
   w: UsageWindow,
-  now: number,
+  average: number | null,
   rate: number | null,
 ): number | null {
-  const start = w.resetsAt - w.lengthS;
   const seen = rate === null ? [] : [rate];
-  if (now - start > 3600) {
-    seen.push(w.used / ((now - start) / 3600));
+  if (average !== null) {
+    seen.push(average);
   }
   const same = sameWindow(rows, w);
   same.forEach((a, i) => {
@@ -166,8 +185,11 @@ const LANE_COVERAGE = 0.5;
 /** An unmeasured window that ends at or below its aim even at this multiple of its average burn does not bind. */
 const FAR_BELOW = 2;
 
-/** How a rate was measured: over a recent stretch, as an upper bound on it, or as the window's average. */
-export type RateBasis = "recent" | "upper-bound" | "window-average";
+/**
+ * How a rate was measured: over a recent stretch, as an upper bound on it, as the burn of the
+ * lanes running now, or as the window's average.
+ */
+export type RateBasis = "recent" | "upper-bound" | "lanes" | "window-average";
 
 export type RecentRate = readonly [
   rate: number | null,
@@ -290,67 +312,85 @@ function laneMean(lanes: LaneReading, since: number, until: number): number | nu
   return weighted / covered;
 }
 
+/** What the running lanes burn (%/h of a window): all of them, and what a new one is taken to add. */
+interface LaneBurn {
+  readonly total: number;
+  readonly each: number;
+  readonly basis: "tokens" | "shared";
+  /** With the tokens basis, each spending lane's burn, highest first. */
+  readonly rates: readonly number[] | null;
+}
+
 /**
- * How many more lanes the headroom to aim supports, from the burn each active lane has been
- * causing.
+ * The burn of the lanes running now: each lane's own tokens, or the window's recent burn shared
+ * out over the lanes active meanwhile (time-weighted) and multiplied back up by those running
+ * now. Null while there is nothing to estimate from.
+ */
+function laneBurn(
+  recent: RecentRate,
+  lanes: LaneReading | null,
+  measured: readonly number[] | null,
+): LaneBurn | null {
+  if (measured && measured.length > 0) {
+    // each lane at its own burn; a new lane is taken to burn as the running ones do on average
+    const total = measured.reduce((sum, r) => sum + r, 0);
+    return { total, each: total / measured.length, basis: "tokens", rates: measured };
+  }
+  const [rate, since, until] = recent;
+  if (!lanes?.active || rate === null || rate <= 0 || since === null || until === null) {
+    return null;
+  }
+  const mean = laneMean(lanes, since, until);
+  if (!mean) {
+    return null; // the lanes over that stretch are not known: the burn cannot be shared out
+  }
+  const each = rate / mean;
+  return { total: each * lanes.active, each, basis: "shared", rates: null };
+}
+
+/**
+ * How many more lanes the headroom to aim supports, each started for newH hours and then read
+ * again, while the running lanes go on for runningH hours.
  *
- * per-lane rate = recent window rate / lanes active over that stretch (time-weighted);
- * supported lanes = headroom points / (per-lane rate * hours), less those already running.
+ * supported lanes = (headroom points - running burn * runningH) / (per-lane burn * newH).
  * Null while there is nothing to estimate from.
  */
 function lanePlan(
   w: UsageWindow,
   aim: number,
-  horizonH: number,
-  recent: RecentRate,
-  lanes: LaneReading | null,
-  measured: readonly number[] | null,
+  runningH: number,
+  newH: number,
+  burn: LaneBurn | null,
+  active: number,
 ): LanePlan {
-  const active = lanes ? lanes.active : 0;
   const out: LanePlan = {
     activeLanes: active,
     perLaneRate: null,
     laneHeadroom: null,
     laneBasis: null,
     laneRates: null,
+    laneHours: null,
   };
   if (aim - w.used <= 0) {
     out.laneHeadroom = 0; // already at the aim: nothing to add, estimate or not
     return out;
   }
-  if (measured && measured.length > 0) {
-    // each lane at its own burn; a new lane is taken to burn as the running ones do on average
-    const total = measured.reduce((sum, r) => sum + r, 0);
-    const mean = total / measured.length;
-    out.laneBasis = "tokens";
-    out.laneRates = measured.map((r) => roundTo(r, 2));
-    if (horizonH <= 0.05 || !(mean > 0)) {
-      return out;
-    }
-    out.perLaneRate = roundTo(mean, 2);
-    out.laneHeadroom = Math.max(0, Math.floor(((aim - w.used) / horizonH - total) / mean));
+  if (burn === null) {
     return out;
   }
-  const [rate, since, until] = recent;
-  if (
-    !active ||
-    rate === null ||
-    rate <= 0 ||
-    horizonH <= 0.05 ||
-    since === null ||
-    until === null ||
-    !lanes
-  ) {
+  const counted = newH > 0.05 && burn.each > 0;
+  if (burn.rates !== null || counted) {
+    out.laneBasis = burn.basis; // each lane's own burn is reported even where no headroom is counted
+  }
+  if (burn.rates !== null) {
+    out.laneRates = burn.rates.map((r) => roundTo(r, 2));
+  }
+  if (!counted) {
     return out;
   }
-  const mean = laneMean(lanes, since, until);
-  if (!mean) {
-    return out; // the lanes over that stretch are not known: the burn cannot be shared out
-  }
-  const per = rate / mean;
-  out.laneBasis = "shared";
-  out.perLaneRate = roundTo(per, 2);
-  out.laneHeadroom = Math.max(0, Math.floor((aim - w.used) / (per * horizonH) - active));
+  out.perLaneRate = roundTo(burn.each, 2);
+  out.laneHours = roundTo(newH, 2);
+  out.laneHeadroom = Math.max(0, Math.floor((aim - w.used - burn.total * runningH) / (burn.each * newH)));
   return out;
 }
 
@@ -401,7 +441,7 @@ function bankedFor(
  * How to use the banked resets on window w: fill it to 100% and redeem. Null with no resets
  * banked. A reset that expires before the window does sets the deadline (its expiry less
  * --redeem-margin); otherwise the window's own reset does. Running out early is fine, so there
- * is no slow down here.
+ * is no slow down here, and the deadline is the latest time to fill, not a speed limit.
  */
 function bankPlan(
   w: UsageWindow,
@@ -534,7 +574,12 @@ export function assess(
   }
   for (const w of windows) {
     const r = rowsOf(w);
-    const [rate, basis] = rateOf(r, w, now);
+    const recent = recentRate(r, w, now);
+    const tokenCost = tokens ? fitTokenCost(r, tokens) : null;
+    const measured = tokens && tokenCost ? laneRates(tokens, tokenCost, now) : null;
+    const burn = laneBurn(recent, lanes, measured);
+    const average = windowAverage(w, now);
+    const [rate, basis] = rateOf(w, recent, average, burn);
     const estimate = basis === "upper-bound" ? null : rate; // a bound can show room left, never on target or over
     const leftH = Math.max(0, (w.resetsAt - now) / 3600);
     let target: number | Float | null = new Float(options.target);
@@ -560,7 +605,7 @@ export function assess(
     const bank = bankPlan(
       w,
       estimate,
-      peakRate(r, w, now, estimate),
+      peakRate(r, w, average, estimate),
       banks.get(w.name) ?? null,
       options,
       now,
@@ -602,18 +647,22 @@ export function assess(
     const previous = lastRollover(r, w);
     // the aim is the target (100% with a reset banked); a window paced through another's cap makes the rest last to 100%
     const aim = goal === null ? 100 : goal;
-    const horizon = bank?.deadline ? bank.hoursToDeadline : leftH;
-    const tokenCost = tokens ? fitTokenCost(r, tokens) : null;
-    const measured = tokens && tokenCost ? laneRates(tokens, tokenCost, now) : null;
-    const lane = lanePlan(w, aim, horizon, recentRate(r, w, now), lanes, measured);
+    // a new lane is started for --lane-hours and then read again. The running lanes are taken to
+    // go on until the window resets; with a reset banked running out early is fine (it is
+    // redeemed then), so they too count only until the next reading
+    const newH = Math.min(options.laneHours, leftH);
+    const runningH = bank ? newH : leftH;
+    const lane = lanePlan(w, aim, runningH, newH, burn, lanes ? lanes.active : 0);
     if (redeeming(bank)) {
       // redeem first: the lanes the window takes afterwards are another question
       lane.perLaneRate = null;
       lane.laneHeadroom = null;
       lane.laneBasis = null;
       lane.laneRates = null;
+      lane.laneHours = null;
     } else if (bank && bank.action === "wait") {
       lane.laneHeadroom = 0; // full until it resets on its own
+      lane.laneHours = null;
     } else if (lane.laneHeadroom === null && !bank && projected !== null && projected > 100) {
       lane.laneHeadroom = 0; // no per-lane estimate yet, but already on pace to run out
     }
@@ -624,6 +673,7 @@ export function assess(
       hoursLeft: roundTo(leftH, 2),
       ratePerHour: rate === null ? null : roundTo(rate, 1),
       rateBasis: basis,
+      windowAverageRate: average === null ? null : roundTo(average, 1),
       projectedAtReset: projected === null ? null : roundToInt(projected),
       target,
       rateNeededForTarget: needed === null ? null : roundTo(needed, 1),
@@ -637,7 +687,7 @@ export function assess(
       observedAt: isoUtc(w.observedAt),
       tokenCost,
     });
-    if (farBelow(w, aim, horizon, now)) {
+    if (farBelow(w, aim, runningH, now)) {
       roomy.add(w.name);
     }
   }
@@ -645,8 +695,13 @@ export function assess(
   return out;
 }
 
-/** The lanes one source supports: [more lanes, per-lane rate, window that binds]; more is null while unmeasured. */
-export function laneSummary(res: readonly WindowAssessment[]): [number | null, number | null, string] {
+/**
+ * The lanes one source supports: [more lanes, per-lane rate, window that binds, hours each new
+ * lane is given]; more is null while unmeasured.
+ */
+export function laneSummary(
+  res: readonly WindowAssessment[],
+): [number | null, number | null, string, number | null] {
   const a = res.find((x) => x.laneBinding) as WindowAssessment;
-  return [a.laneHeadroom, a.perLaneRate, a.window];
+  return [a.laneHeadroom, a.perLaneRate, a.window, a.laneHours];
 }

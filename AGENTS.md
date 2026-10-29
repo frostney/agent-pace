@@ -11,8 +11,11 @@
 - Output is a contract. The text lines, the `--json` fields and their types, the help and
   usage errors, and the state files (`~/.local/state/agent-pace/*.csv`, `claude-banked.json`)
   match what the Python version 1.4 printed and wrote, digit for digit, apart from the measured
-  per-lane burn (its lane numbers and its `lane_basis`, `lane_rates` and `token_cost` fields)
-  and `tokens-<source>.json`, which the Python version did not have. Number formatting goes
+  per-lane burn (its lane numbers and its `lane_basis`, `lane_rates` and `token_cost` fields),
+  lane headroom over `--lane-hours` with a week paced by its running lanes (the lane numbers and
+  wording, a week's rate, status and `lanes` rate basis, the `lane_hours`, `lanes.hours` and
+  `window_average_rate` fields, and the `--lane-hours` help and usage error) and
+  `tokens-<source>.json`, which the Python version did not have. Number formatting goes
   through `src/python-format.ts` and JSON through `src/python-json.ts`; never use
   `toFixed`, `String(number)` or `JSON.stringify` for output. A change to any of these is a
   breaking change and needs its own release note.

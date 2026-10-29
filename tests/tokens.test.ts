@@ -562,7 +562,8 @@ describe("TokenLanes", () => {
     expect(five.lane_basis).toBe("tokens");
     expect(five.lane_rates).toEqual(rates.map((r) => Math.round(r * 100) / 100));
     expect(five.per_lane_rate).toBe(Math.round(mean * 100) / 100);
-    expect(five.lane_headroom).toBe(Math.floor(((97 - 30) / ((R5 - NOW) / 3600) - total) / mean));
+    // the running lanes go on until the reset, a new one for an hour
+    expect(five.lane_headroom).toBe(Math.floor((97 - 30 - total * ((R5 - NOW) / 3600)) / mean));
     expect(five.token_cost).toEqual({ points_per_dollar: ppd, runs: 1, points: 20, dollars: 90 });
     expect(hours).toBe(1.17);
   });
@@ -612,7 +613,7 @@ describe("TokenLanes", () => {
       "tokens",
       [Math.round(rate * 100) / 100],
     ]);
-    expect(five.lane_headroom).toBe(Math.floor(((97 - 2) / ((R5 - NOW) / 3600) - rate) / rate));
+    expect(five.lane_headroom).toBe(Math.floor((97 - 2 - rate * ((R5 - NOW) / 3600)) / rate));
   });
 
   test("a lane that has just started is averaged over five minutes, not one", async () => {
@@ -627,6 +628,41 @@ describe("TokenLanes", () => {
     c.claudeSpending("idle", [{ t: M - 120, id: "idle-0", model: "claude-opus-5-5", usage: opusOutput(0) }]);
     const use = await ledger();
     expect(laneRates(use, { pointsPerDollar: 0.2, runs: 1, points: 20, dollars: 100 }, NOW)).toHaveLength(1);
+  });
+
+  test("a week is paced by what its running lanes spend, not its window average", async () => {
+    // a week at 88% with 62.9h left, 0.8%/h on average; it moved 3 points in the last 23 hours
+    // while lane a spent evenly, so the lane burns about 0.13%/h
+    const weekReset = Math.trunc(NOW + 62.9 * 3600);
+    c.claude.seven_day = { utilization: 88, resets_at: iso(weekReset) };
+    c.history("claude", "7d", [[NOW - 23 * 3600, 85]], weekReset);
+    lane("a", 23 * 60, 0.1);
+    const data = await c.json("claude");
+    const week = (data.windows as Fields[])[1] as Fields;
+    const each = (week.lane_rates as number[])[0] as number;
+    expect([week.rate_basis, week.lane_basis, week.window_average_rate]).toEqual(["lanes", "tokens", 0.8]);
+    expect(each).toBeCloseTo(0.13, 2);
+    expect(week.status).toBe("on-target"); // by its window average it would end near 141%: slow down
+    expect(week.lane_headroom).toBeGreaterThan(0);
+    const out = await c.claudeOut("--state", c.copyState());
+    expect(out).toContain("7d 88% 0.1%/h (lanes, window avg 0.8%/h) 62.9h left, ends ~96%");
+    expect(out).not.toContain("slow down");
+  });
+
+  test("a banked reset is judged by a peak no lower than the lanes' burn now", async () => {
+    // the week at 88% moved 3 points in 23 hours, all while lane a spent the last half hour: it
+    // burns about 6%/h now, against 0.8%/h on average; a reset expires in 8h (fill by 6h)
+    const weekReset = Math.trunc(NOW + 62.9 * 3600);
+    c.claude.seven_day = { utilization: 88, resets_at: iso(weekReset) };
+    c.history("claude", "7d", [[NOW - 23 * 3600, 85]], weekReset);
+    lane("a", 30, 10);
+    c.grant({ ends_at: iso(NOW + 8 * 3600).replace("Z", "+00:00") });
+    const week = ((await c.json("claude")).windows as Fields[])[1] as Fields;
+    const bank = week.banked as Fields;
+    expect(week.rate_basis).toBe("lanes");
+    expect(bank.peak_rate as number).toBeGreaterThanOrEqual(bank.rate_now as number);
+    // at the 0.8%/h average it would end near 93%: redeem anyway; the lanes fill it in time
+    expect(bank.action).toBe("fill");
   });
 
   test("without a learned cost the lanes are shared out as before", async () => {

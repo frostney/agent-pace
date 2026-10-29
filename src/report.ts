@@ -15,14 +15,15 @@ import type { Reading, ReadingWithLanes, Source } from "./usage.ts";
 
 /** What the lane headroom says, as advice. */
 export function lanePhrase(res: readonly WindowAssessment[]): string {
-  const [more, per] = laneSummary(res);
+  const [more, per, , hours] = laneSummary(res);
   if (more === null) {
     return "measuring: start at most 1-2 new lanes";
   }
   if (more === 0) {
     return "no lane headroom: start nothing new";
   }
-  return `room for ~${more} more lane${more > 1 ? "s" : ""} at ${per === null ? "None" : floatRepr(per)}%/h each`;
+  const each = `at ${per === null ? "None" : floatRepr(per)}%/h each`;
+  return `room for ~${more} more lane${more > 1 ? "s" : ""} ${each}${hours === null ? "" : ` for ${floatRepr(hours)}h`}`;
 }
 
 const ADVICE: Record<Status, string> = {
@@ -36,6 +37,7 @@ const ADVICE: Record<Status, string> = {
 const BASIS_NOTE: Record<RateBasis, string> = {
   recent: "",
   "upper-bound": " (at most)",
+  lanes: " (lanes)",
   "window-average": " (window avg)",
 };
 
@@ -46,8 +48,11 @@ export function render(
   timeZone: string | undefined,
 ): string {
   const parts = res.map((a) => {
-    const rate =
-      a.ratePerHour === null ? "?" : `${floatRepr(a.ratePerHour)}%/h${BASIS_NOTE[a.rateBasis ?? "recent"]}`;
+    let note = BASIS_NOTE[a.rateBasis ?? "recent"];
+    if (a.rateBasis === "lanes" && a.windowAverageRate !== null) {
+      note = ` (lanes, window avg ${floatRepr(a.windowAverageRate)}%/h)`;
+    }
+    const rate = a.ratePerHour === null ? "?" : `${floatRepr(a.ratePerHour)}%/h${note}`;
     let s = `${a.window} ${formatFixed(a.used, 0)}% ${rate} ${floatRepr(a.hoursLeft)}h left`;
     if (a.projectedAtReset !== null && a.projectedAtReset <= 100) {
       s += `, ends ~${a.projectedAtReset}%`;
@@ -181,8 +186,14 @@ export function bankedJson(reading: Reading): JsonObject {
 }
 
 export function lanesJson(res: readonly WindowAssessment[]): JsonObject {
-  const [more, per, window] = laneSummary(res);
-  return { active: res[0]?.activeLanes ?? 0, headroom: more, per_lane_rate: float(per), window };
+  const [more, per, window, hours] = laneSummary(res);
+  return {
+    active: res[0]?.activeLanes ?? 0,
+    headroom: more,
+    per_lane_rate: float(per),
+    window,
+    hours: float(hours),
+  };
 }
 
 function bankJson(b: BankAdvice | null): Json {
@@ -216,6 +227,7 @@ export function windowJson(a: WindowAssessment): JsonObject {
     hours_left: float(a.hoursLeft),
     rate_per_hour: float(a.ratePerHour),
     rate_basis: a.rateBasis,
+    window_average_rate: float(a.windowAverageRate),
     projected_at_reset: a.projectedAtReset,
     target: a.target,
     rate_needed_for_target: float(a.rateNeededForTarget),
@@ -231,6 +243,7 @@ export function windowJson(a: WindowAssessment): JsonObject {
     observed_at: a.observedAt,
     lane_basis: a.laneBasis,
     lane_rates: a.laneRates === null ? null : a.laneRates.map(float),
+    lane_hours: float(a.laneHours),
     token_cost:
       a.tokenCost === null
         ? null

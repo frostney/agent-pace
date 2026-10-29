@@ -7,9 +7,9 @@ advises: it never redeems a reset.
 
 ```console
 $ agent-pace plan
-route spare work to Codex: banked reset expires in 36h and cannot be filled by then (needs 2.4%/h, peak 0.7%/h); fill what you can, then redeem it (lanes: Codex room for ~5 more lanes at 0.3%/h each; Claude measuring: start at most 1-2 new lanes)
+route spare work to Codex: banked reset expires in 36h and cannot be filled by then (needs 2.4%/h, peak 0.7%/h); fill what you can, then redeem it (lanes: Codex room for ~264 more lanes at 0.3%/h each for 1.0h; Claude measuring: start at most 1-2 new lanes)
   12:25 claude: 5h 6% ? 1.17h left (78.0%/h lands on 97.0%) -> measuring | 7d 40% 0.6%/h (window avg) 96.0h left, ends ~93% (0.6%/h lands on 97.0%) -> keep going (measuring: start at most 1-2 new lanes)
-  12:25 codex: 7d 20% 0.7%/h (window avg) 139.81h left, runs out in ~4.8d (2.4%/h lands on 100%) -> room left: add work (room for ~5 more lanes at 0.3%/h each)
+  12:25 codex: 7d 20% 0.7%/h (window avg) 139.81h left, runs out in ~4.8d (2.4%/h lands on 100%) -> room left: add work (room for ~264 more lanes at 0.3%/h each for 1.0h)
     banked reset expires Fri 24 Oct 00:10 (in 35.8h): cannot reach 100% by then (needs 2.4%/h, peak seen 0.7%/h); redeem it anyway by Thu 23 Oct 22:10, an unused reset is lost [3 banked]
 ```
 
@@ -19,7 +19,7 @@ Each [release](https://github.com/frostney/agent-pace/releases) has a standalone
 macOS and Linux (arm64 and x64), with `claude-pace` and `codex-pace` links beside it:
 
 ```sh
-version=1.4.0 target=darwin-arm64   # or darwin-x64, linux-x64, linux-arm64
+version=2.0.0 target=darwin-arm64   # or darwin-x64, linux-x64, linux-arm64
 curl -fsSL "https://github.com/frostney/agent-pace/releases/download/v$version/agent-pace-$version-$target.tar.gz" \
   | tar -xz -C ~/.local/bin --strip-components=1 \
       "agent-pace-$version-$target/agent-pace" \
@@ -61,7 +61,11 @@ takes it from any link or copy with that name; run from source, only the `claude
 ### What it reports
 
 Per window: usage, burn rate, time to reset, the projected usage at reset, and the rate that
-lands on `--target`. It takes resets into account:
+lands on `--target`. A short window's burn is its recent rate. A week is bursty, so it is paced
+by what the lanes running now spend, measured from their own tokens ("0.1%/h (lanes, window avg
+0.8%/h)"), and by its average so far ("window avg") while that is not learned or no lane is
+spending. A week's whole points move too seldom for a recent rate to pace it. It takes resets
+into account:
 - When a window rolls over, it says how the finished window ended against the target (for
   example "ended at 96%, 4% unused").
 - `--plan even` caps the short window's target by what the long window can afford: the long
@@ -76,7 +80,9 @@ lands on `--target`. It takes resets into account:
 Both providers can grant resets that refill a window and expire if unused. A banked reset is
 used by filling the window it clears to about 100% and then redeeming it, so with one banked
 the target is 100%, not `--target`, and running out early is fine: there is no `--reserve`
-taper and no "slow down". A Codex reset clears every window, so it is spent on the longest. A
+taper and no "slow down". A deadline is the latest time to fill the window by, not a speed
+limit: lane headroom with a reset banked only asks that the window not reach 100% before the
+next reading. A Codex reset clears every window, so it is spent on the longest. A
 Claude grant clears the windows it lists: a session grant only the 5h window (so it only lifts
 the 5h target), a weekly or full grant the 7d window.
 - A reset that expires before the window resets: the target is 100% by that expiry minus
@@ -127,17 +133,22 @@ where the window has room):
   left, never on target or over, and gives no projection). Anything shorter is no estimate,
   nor is a stretch across a drop in use or one whose latest reading is over 10 minutes old.
   The rate a short window's status and projection use is held to the same evidence (a
-  day-long window is paced by its average).
+  day-long window is paced by its running lanes' tokens, or its average).
 - **Time-weighted lanes:** the lanes are weighted from the counts agent-pace remembers at each
   reading (`lanes-<source>.csv`) and the count now. A count covers the 10 minutes before it,
   back to the count before it, so a count taken before the lanes started does not dilute them.
   Time no count covers is left out; with less than half the stretch covered there is no
   estimate.
-- **Lanes supported** = (aim - used) / (per-lane burn * hours), less the lanes already running,
-  rounded down, not below 0. Measured, the lanes running burn what they each burn and a new lane
-  is taken to burn their average: ((aim - used) / hours - their total) / their average. The aim is the target (100% with a reset banked; 100% for a window
-  paced through the other's cap). The hours run to the window's reset, or to the deadline a
-  banked reset sets. The window with the least room binds (the longer one on a tie).
+- **Lanes supported** = (aim - used - running burn * running hours) / (per-lane burn * lane
+  hours), rounded down, not below 0. A new lane is started for `--lane-hours` (default 1) and
+  then read again, so it counts only for those hours (never past the window's reset); the lanes
+  already running are taken to go on until the window resets. With a reset banked running out
+  early is fine (redeem it then), so the running lanes too count only for the lane hours. Shared
+  out, the running burn is the per-lane burn times the lanes running now; measured, the lanes
+  running burn what they each burn and a new lane is taken to burn their average. The aim is
+  the target (100% with a reset banked; 100% for a window paced through the other's cap). The
+  window with the least room binds (the longer one on a tie). Read again before starting more:
+  the lanes started last time are running lanes now.
 - **Measuring:** without an estimate, or with no active lanes, it says "measuring" and suggests
   at most 1-2 new lanes. One window that cannot be measured yet makes the whole source
   unmeasured, unless another window has no room, or it is far below its aim: even at twice its
@@ -145,8 +156,11 @@ where the window has room):
   with 111 hours left would. A window with nothing banked whose projection runs out before its
   reset has no room either.
 
-`--json` adds `active_lanes`, `per_lane_rate`, `lane_headroom` and `lane_binding` (the window
-whose headroom the source reports) to each window, and a `lanes` summary. `lane_basis` says
+`--json` adds `active_lanes`, `per_lane_rate`, `lane_headroom`, `lane_hours` (the hours a new
+lane was given) and `lane_binding` (the window whose headroom the source reports) to each
+window, and a `lanes` summary with the same `hours`. `rate_basis` is `lanes` when a week is
+paced by its running lanes' tokens, and `window_average_rate` gives the window's average burn beside
+it. `lane_basis` says
 how the per-lane burn was found (`tokens`, `shared`, or null without one), `lane_rates` lists
 each measured lane's burn, highest first, and `token_cost` gives the learned
 `points_per_dollar` with the `runs`, `points` and `dollars` it was learned from.
@@ -199,6 +213,7 @@ more lanes each provider supports. It changes nothing.
 | `--plan fill\|even`                  | fill                        | how the short window is paced against the long one                                                                                                                             |
 | `--reserve`                          | 10                          | with `--plan fill`, pace like `--plan even` once the long window has this many points left                                                                                     |
 | `--redeem-margin HOURS`              | 2                           | fill a window to 100% this many hours before a banked reset expires; at the limit, keep a reset (nothing expires first) if the window resets on its own within this many hours |
+| `--lane-hours HOURS`                 | 1                           | the hours each new lane is given before the next reading when counting lane headroom                                                                                           |
 | `--state DIR`                        | `~/.local/state/agent-pace` | where the history is kept (`$XDG_STATE_HOME/agent-pace` when that is set)                                                                                                      |
 | `--notify CMD`                       |                             | run CMD with the alert text as its last argument on each alert or reset, e.g. `--notify notify-send` or `--notify 'curl -d'` plus an ntfy URL                                  |
 | `--watch`, `--alerts-only`, `--json` |                             | poll; print only alerts; print JSON                                                                                                                                            |
@@ -238,9 +253,11 @@ always terminated); the fallback snapshots come from `$CODEX_HOME/sessions` (def
 
 agent-pace 1.4 was a Python script. This TypeScript version prints the same text and `--json`
 digit for digit, takes the same flags, and reads and writes the same state files, so a history
-the Python version kept carries over. Two things are new: the measured per-lane burn, which
-changes the lane numbers once points per dollar are learned, and the `--json` fields that
-describe it. Otherwise they differ only here:
+the Python version kept carries over. Three things are new: the measured per-lane burn, which
+changes the lane numbers once points per dollar are learned; lane headroom over
+`--lane-hours` with a week paced by its running lanes (2.0), which changes the lane numbers, a
+week's rate and status, and the lane wording; and the `--json` fields that describe them.
+Otherwise they differ only here:
 - Failures the operating system reports use urllib's and OSError's frames (`<urlopen error
   ...>`, `[Errno 2] No such file or directory: ...`); a refused connection and an unknown host
   read as Python's did, other failures carry Bun's wording.

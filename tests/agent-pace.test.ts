@@ -604,15 +604,23 @@ describe("Lanes", () => {
 
   test("lanes running with headroom", async () => {
     codexBurn(20, 0.6, 2);
-    const deadlineH = ((CREDITS[0]?.expiresAt as number) - 7200 - NOW) / 3600; // the first reset is filled 2h before it expires
-    const expected = Math.floor((100 - 20) / (0.3 * deadlineH) - 2);
-    expect(expected).toBe(5);
+    // with a reset banked running out early is fine: every lane counts for the next hour
+    const expected = Math.floor((100 - 20 - 0.6 * 1) / (0.3 * 1));
+    expect(expected).toBe(264);
     const out = await c.codex();
-    expect(out).toContain(`-> room left: add work (room for ~${expected} more lanes at 0.3%/h each)`);
+    expect(out).toContain(
+      `-> room left: add work (room for ~${expected} more lanes at 0.3%/h each for 1.0h)`,
+    );
     const lanes = await c.json("codex");
     const w = first(lanes);
-    expect([w.active_lanes, w.per_lane_rate, w.lane_headroom]).toEqual([2, 0.3, expected]);
-    expect(lanes.lanes).toEqual({ active: 2, headroom: expected, per_lane_rate: 0.3, window: "7d" });
+    expect([w.active_lanes, w.per_lane_rate, w.lane_headroom, w.lane_hours]).toEqual([2, 0.3, expected, 1]);
+    expect(lanes.lanes).toEqual({
+      active: 2,
+      headroom: expected,
+      per_lane_rate: 0.3,
+      window: "7d",
+      hours: 1,
+    });
   });
 
   test("a banked reset raises the aim", async () => {
@@ -626,9 +634,9 @@ describe("Lanes", () => {
       results[name] = first(await c.json("codex", "--state", c.copyState())).lane_headroom;
     }
     const leftH = (RESET - NOW) / 3600;
-    expect(results.banked).toBe(Math.floor(80 / (0.1416 * leftH) - 1));
-    expect(results.none).toBe(Math.floor(77 / (0.1416 * leftH) - 1));
-    expect([results.none, results.banked]).toEqual([2, 3]);
+    expect(results.banked).toBe(Math.floor((80 - 0.1416) / 0.1416)); // to 100% within the hour, then redeem
+    expect(results.none).toBe(Math.floor((77 - 0.1416 * leftH) / 0.1416)); // to 97% by the reset
+    expect([results.none, results.banked]).toEqual([403, 563]);
   });
 
   test("no headroom near the limit stops a room left nudge", async () => {
@@ -647,7 +655,7 @@ describe("Lanes", () => {
     expect(out).not.toContain("room left"); // the 5h window alone would invite work
     expect(out.split("no lane headroom: start nothing new").length - 1).toBe(2);
     const data = await c.json("claude", "--state", c.copyState());
-    expect(data.lanes).toEqual({ active: 2, headroom: 0, per_lane_rate: 0.6, window: "7d" });
+    expect(data.lanes).toEqual({ active: 2, headroom: 0, per_lane_rate: 0.6, window: "7d", hours: 1 });
     const [five, seven] = windows(data) as [Json, Json];
     expect(five.lane_headroom as number).toBeGreaterThan(0);
     expect([seven.lane_headroom, seven.lane_binding, five.status]).toEqual([0, true, "under"]);
@@ -657,7 +665,7 @@ describe("Lanes", () => {
   test("the 5h window binds when it has the least room", async () => {
     claudeWindowsMeasured(10.0, 0.08, { fiveUsed: 60 });
     const data = await c.json("claude");
-    expect(windows(data).map((w) => w.lane_headroom)).toEqual([2, 6]);
+    expect(windows(data).map((w) => w.lane_headroom)).toEqual([2, 616]);
     expect((data.lanes as Json).window).toBe("5h");
     expect((data.lanes as Json).headroom).toBe(first(data).lane_headroom);
     expect(first(data).lane_binding).toBe(true);
@@ -665,7 +673,8 @@ describe("Lanes", () => {
 
   test("a tie binds the longer window", async () => {
     claudeWindowsMeasured(10.0, 0.08); // both windows end up with room for 6 more lanes
-    const data = await c.json("claude");
+    // each new lane counted until its window resets, as every lane was before --lane-hours
+    const data = await c.json("claude", "--lane-hours", "168");
     const [five, seven] = windows(data) as [Json, Json];
     expect(five.lane_headroom).toBe(seven.lane_headroom);
     expect(five.lane_headroom).toBe(6);
@@ -864,8 +873,9 @@ describe("Lanes", () => {
     c.laneHistory("claude", every(300, NOW - 48 * 3600, NOW, 1));
     const seven = windows(await c.json("claude"))[1] as Json;
     expect(seven.target).toBeNull();
-    expect(seven.lane_headroom).toBe(Math.floor((100 - 95) / ((1 / 48) * (seven.hours_left as number)) - 1));
-    expect(seven.lane_headroom).toBe(1); // aimed at 97 it would be 0
+    const per = 1 / 48;
+    expect(seven.lane_headroom).toBe(Math.floor((100 - 95 - per * (seven.hours_left as number)) / per));
+    expect(seven.lane_headroom).toBe(144); // aimed at 97 it would be 0
   });
 
   test("a window seconds from its reset is no estimate", async () => {
@@ -966,7 +976,7 @@ describe("Lanes", () => {
       const data = await c.json("claude", "--state", c.copyState());
       expect(windows(data)[1]?.lane_headroom).toBeNull();
       expect((data.lanes as Json).window).toBe(binds);
-      expect((data.lanes as Json).headroom).toBe(binds === "5h" ? 6 : null);
+      expect((data.lanes as Json).headroom).toBe(binds === "5h" ? 7 : null);
     }
   });
 
@@ -1006,17 +1016,18 @@ describe("Lanes", () => {
     const line = await c.planLine();
     expect(
       line.endsWith(
-        " (lanes: Codex room for ~5 more lanes at 0.3%/h each; Claude measuring: start at most 1-2 new lanes)",
+        " (lanes: Codex room for ~264 more lanes at 0.3%/h each for 1.0h; Claude measuring: start at most 1-2 new lanes)",
       ),
     ).toBe(true);
     const data = await c.json("plan");
-    expect(((data.codex as Json).lanes as Json).headroom).toBe(5);
+    expect(((data.codex as Json).lanes as Json).headroom).toBe(264);
     expect(((data.claude as Json).lanes as Json).headroom).toBeNull();
   });
 
   test("plan says when the routed provider has no lane headroom", async () => {
     codexBurn(20, 6.0, 5); // five lanes burning 1.2%/h each: no room for more before the reset
-    expect(await c.planLine()).toContain(
+    // each new lane counted until the reset (with a reset banked, an hour would leave room)
+    expect(await c.planLine("--lane-hours", "168")).toContain(
       " - but Codex has no lane headroom right now (lanes: Codex no lane headroom: start nothing new;",
     );
   });
@@ -1166,7 +1177,7 @@ describe("Replay", () => {
     const [text, data] = (await replay())[1] as [string, Json]; // 08:21:52
     expect(text).not.toContain("no lane headroom");
     expect(text).toContain("measuring: start at most 1-2 new lanes");
-    expect(data.lanes).toEqual({ active: 4, headroom: null, per_lane_rate: null, window: "5h" });
+    expect(data.lanes).toEqual({ active: 4, headroom: null, per_lane_rate: null, window: "5h", hours: null });
   });
 
   test("three points measure the lanes and the flat week does not bind", async () => {
@@ -1179,12 +1190,12 @@ describe("Replay", () => {
     const lanes = (600 * 4 + 540 * 3 + 68 * 3 + 308 * 5) / (1761208628 - 1761207094 - 18); // 18s before 08:11:52 no count covers
     const [five, week] = windows(data) as [Json, Json];
     expect(five.per_lane_rate).toBe(roundTo(rate / lanes, 2));
-    expect(five.lane_headroom).toBe(
-      Math.floor((97 - 7) / ((rate / lanes) * (five.hours_left as number)) - 5),
-    );
-    expect(data.lanes).toEqual({ active: 5, headroom: 5, per_lane_rate: 1.85, window: "5h" });
+    // the five running lanes go on until the 5h reset, a new one for an hour
+    const per = rate / lanes;
+    expect(five.lane_headroom).toBe(Math.floor((97 - 7 - per * 5 * (five.hours_left as number)) / per));
+    expect(data.lanes).toEqual({ active: 5, headroom: 25, per_lane_rate: 1.85, window: "5h", hours: 1 });
     expect([week.used, week.lane_headroom, week.lane_binding]).toEqual([9, null, false]);
-    expect(text).toContain("room for ~5 more lanes at 1.85%/h each");
+    expect(text).toContain("room for ~25 more lanes at 1.85%/h each for 1.0h");
   });
 });
 
