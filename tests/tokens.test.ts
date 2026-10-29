@@ -562,7 +562,8 @@ describe("TokenLanes", () => {
     expect(five.lane_basis).toBe("tokens");
     expect(five.lane_rates).toEqual(rates.map((r) => Math.round(r * 100) / 100));
     expect(five.per_lane_rate).toBe(Math.round(mean * 100) / 100);
-    expect(five.lane_headroom).toBe(Math.floor(((97 - 30) / ((R5 - NOW) / 3600) - total) / mean));
+    // the running lanes go on until the reset, a new one for an hour
+    expect(five.lane_headroom).toBe(Math.floor((97 - 30 - total * ((R5 - NOW) / 3600)) / mean));
     expect(five.token_cost).toEqual({ points_per_dollar: ppd, runs: 1, points: 20, dollars: 90 });
     expect(hours).toBe(1.17);
   });
@@ -612,7 +613,7 @@ describe("TokenLanes", () => {
       "tokens",
       [Math.round(rate * 100) / 100],
     ]);
-    expect(five.lane_headroom).toBe(Math.floor(((97 - 2) / ((R5 - NOW) / 3600) - rate) / rate));
+    expect(five.lane_headroom).toBe(Math.floor((97 - 2 - rate * ((R5 - NOW) / 3600)) / rate));
   });
 
   test("a lane that has just started is averaged over five minutes, not one", async () => {

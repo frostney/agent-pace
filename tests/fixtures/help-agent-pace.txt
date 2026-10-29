@@ -1,7 +1,7 @@
 usage: agent-pace [-h] [--watch] [--alerts-only] [--json] [--target TARGET]
                   [--band BAND] [--interval INTERVAL] [--plan {fill,even}]
-                  [--reserve RESERVE] [--redeem-margin HOURS] [--state STATE]
-                  [--notify CMD]
+                  [--reserve RESERVE] [--redeem-margin HOURS]
+                  [--lane-hours HOURS] [--state STATE] [--notify CMD]
                   {claude,codex,plan}
 
 Pace agent work against Claude Code and Codex usage windows, including banked
@@ -27,6 +27,8 @@ options:
                         banked reset expires; at the limit, keep a banked
                         reset (nothing expires first) if the window resets on
                         its own within this many hours
+  --lane-hours HOURS    give each new lane this many hours before the next
+                        reading when counting lane headroom (default 1)
   --state STATE
   --notify CMD          run CMD with the alert text as its last argument on
                         each alert or reset
@@ -39,4 +41,8 @@ of a fifth of the window, which bounds the burn by one point more than it
 moved. Until then it says "measuring"; a short window's status uses the same
 rate. A window that cannot be measured does not hold the source at "measuring"
 if, after its first hour, even twice its average burn would end it at or below
-its aim.
+its aim. A new lane is counted for --lane-hours, then read again; the lanes
+already running are taken to go on until the window resets, or with a reset
+banked (running out early is fine, then redeem it) only until the next
+reading. A week is paced by the lanes running now when their burn is known, by
+its window average otherwise.

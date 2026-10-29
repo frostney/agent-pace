@@ -14,6 +14,7 @@ export interface Options {
   readonly plan: PlanMode;
   readonly reserve: number;
   readonly redeemMargin: number;
+  readonly laneHours: number;
   readonly state: string;
   readonly notify: string | null;
 }
@@ -23,7 +24,7 @@ type Dest = Exclude<keyof Options, "source">;
 /** An option and the type of value it takes, which fixes the fields it may set. */
 type OptionSpec = { readonly flag: string; readonly metavar?: string; readonly help?: string } & (
   | { readonly kind: "flag"; readonly dest: "watch" | "alertsOnly" | "json" }
-  | { readonly kind: "float"; readonly dest: "target" | "band" | "reserve" | "redeemMargin" }
+  | { readonly kind: "float"; readonly dest: "target" | "band" | "reserve" | "redeemMargin" | "laneHours" }
   | { readonly kind: "int"; readonly dest: "interval" }
   | { readonly kind: "string"; readonly dest: "state" | "notify" }
   | { readonly kind: "choice"; readonly dest: "plan"; readonly choices: readonly PlanMode[] }
@@ -53,6 +54,13 @@ const OPTIONS: readonly OptionSpec[] = [
       "aim to fill a window to 100% this many hours before a banked reset expires; at the limit, keep a banked reset " +
       "(nothing expires first) if the window resets on its own within this many hours",
   },
+  {
+    flag: "--lane-hours",
+    dest: "laneHours",
+    kind: "float",
+    metavar: "HOURS",
+    help: "give each new lane this many hours before the next reading when counting lane headroom (default 1)",
+  },
   { flag: "--state", dest: "state", kind: "string", metavar: "STATE" },
   {
     flag: "--notify",
@@ -77,7 +85,10 @@ const EPILOG =
   "moving 3 points, or a stretch of a fifth of the window, which bounds the burn by one point more " +
   'than it moved. Until then it says "measuring"; a short window\'s status uses the same rate. A window that cannot be ' +
   'measured does not hold the source at "measuring" if, after its first hour, even twice its ' +
-  "average burn would end it at or below its aim.";
+  "average burn would end it at or below its aim. A new lane is counted for --lane-hours, then read again; the " +
+  "lanes already running are taken to go on until the window resets, or with a reset banked (running out early " +
+  "is fine, then redeem it) only until the next reading. A week is paced by the lanes running now when their " +
+  "burn is known, by its window average otherwise.";
 
 function metavar(spec: OptionSpec): string {
   return spec.kind === "choice" ? `{${spec.choices.join(",")}}` : (spec.metavar ?? "");
@@ -184,6 +195,7 @@ export class ArgumentParser {
       plan: "fill",
       reserve: 10,
       redeemMargin: 2,
+      laneHours: 1,
       state: defaultState,
       notify: null,
     };
@@ -249,6 +261,9 @@ export class ArgumentParser {
           const parsed = parseFloatText(value);
           if (parsed === null) {
             return `argument ${spec.flag}: invalid float value: ${stringRepr(value)}`;
+          }
+          if (spec.dest === "laneHours" && !(parsed > 0)) {
+            return `argument ${spec.flag}: must be more than 0: ${stringRepr(value)}`;
           }
           values[spec.dest] = parsed;
           return null;
