@@ -40,5 +40,5 @@ if, after its first hour, even twice its average burn would end it at or below
 its aim. A new lane is counted for --lane-hours, then read again; the lanes
 already running are taken to go on until the window resets, or with a reset
 banked (running out early is fine, then redeem it) only until the next
-reading. A week is paced by the lanes running now when their burn is known, by
-its window average otherwise.
+reading. A week is paced by what the lanes running now spend when their tokens
+measure it, by its window average otherwise.

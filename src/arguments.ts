@@ -24,7 +24,12 @@ type Dest = Exclude<keyof Options, "source">;
 /** An option and the type of value it takes, which fixes the fields it may set. */
 type OptionSpec = { readonly flag: string; readonly metavar?: string; readonly help?: string } & (
   | { readonly kind: "flag"; readonly dest: "watch" | "alertsOnly" | "json" }
-  | { readonly kind: "float"; readonly dest: "target" | "band" | "reserve" | "redeemMargin" | "laneHours" }
+  | {
+      readonly kind: "float";
+      readonly dest: "target" | "band" | "reserve" | "redeemMargin" | "laneHours";
+      /** The value must be above 0. */
+      readonly positive?: boolean;
+    }
   | { readonly kind: "int"; readonly dest: "interval" }
   | { readonly kind: "string"; readonly dest: "state" | "notify" }
   | { readonly kind: "choice"; readonly dest: "plan"; readonly choices: readonly PlanMode[] }
@@ -58,6 +63,7 @@ const OPTIONS: readonly OptionSpec[] = [
     flag: "--lane-hours",
     dest: "laneHours",
     kind: "float",
+    positive: true,
     metavar: "HOURS",
     help: "give each new lane this many hours before the next reading when counting lane headroom (default 1)",
   },
@@ -87,8 +93,8 @@ const EPILOG =
   'measured does not hold the source at "measuring" if, after its first hour, even twice its ' +
   "average burn would end it at or below its aim. A new lane is counted for --lane-hours, then read again; the " +
   "lanes already running are taken to go on until the window resets, or with a reset banked (running out early " +
-  "is fine, then redeem it) only until the next reading. A week is paced by the lanes running now when their " +
-  "burn is known, by its window average otherwise.";
+  "is fine, then redeem it) only until the next reading. A week is paced by what the lanes running now spend " +
+  "when their tokens measure it, by its window average otherwise.";
 
 function metavar(spec: OptionSpec): string {
   return spec.kind === "choice" ? `{${spec.choices.join(",")}}` : (spec.metavar ?? "");
@@ -262,7 +268,7 @@ export class ArgumentParser {
           if (parsed === null) {
             return `argument ${spec.flag}: invalid float value: ${stringRepr(value)}`;
           }
-          if (spec.dest === "laneHours" && !(parsed > 0)) {
+          if (spec.positive && !(parsed > 0)) {
             return `argument ${spec.flag}: must be more than 0: ${stringRepr(value)}`;
           }
           values[spec.dest] = parsed;

@@ -630,6 +630,25 @@ describe("TokenLanes", () => {
     expect(laneRates(use, { pointsPerDollar: 0.2, runs: 1, points: 20, dollars: 100 }, NOW)).toHaveLength(1);
   });
 
+  test("a week is paced by what its running lanes spend, not its window average", async () => {
+    // a week at 88% with 62.9h left, 0.8%/h on average; it moved 3 points in the last 23 hours
+    // while lane a spent evenly, so the lane burns about 0.13%/h
+    const weekReset = Math.trunc(NOW + 62.9 * 3600);
+    c.claude.seven_day = { utilization: 88, resets_at: iso(weekReset) };
+    c.history("claude", "7d", [[NOW - 23 * 3600, 85]], weekReset);
+    lane("a", 23 * 60, 0.1);
+    const data = await c.json("claude");
+    const week = (data.windows as Fields[])[1] as Fields;
+    const each = (week.lane_rates as number[])[0] as number;
+    expect([week.rate_basis, week.lane_basis, week.window_average_rate]).toEqual(["lanes", "tokens", 0.8]);
+    expect(each).toBeCloseTo(0.13, 2);
+    expect(week.status).toBe("on-target"); // by its window average it would end near 141%: slow down
+    expect(week.lane_headroom).toBeGreaterThan(0);
+    const out = await c.claudeOut("--state", c.copyState());
+    expect(out).toContain("7d 88% 0.1%/h (lanes, window avg 0.8%/h) 62.9h left, ends ~96%");
+    expect(out).not.toContain("slow down");
+  });
+
   test("without a learned cost the lanes are shared out as before", async () => {
     (c.claude.five_hour as Fields).utilization = 30;
     lane("a", 60, 1);

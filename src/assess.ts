@@ -102,20 +102,20 @@ function windowAverage(w: UsageWindow, now: number): number | null {
 }
 
 function rateOf(
-  rows: readonly HistoryRow[],
   w: UsageWindow,
-  now: number,
+  recent: RecentRate,
+  average: number | null,
   burn: LaneBurn | null,
 ): [number | null, RateBasis | null] {
   if (w.lengthS >= 86400) {
-    // a week is bursty: pace it by the lanes running now, or failing that its average so far, not the last minutes
-    if (burn !== null && burn.each > 0) {
-      return [burn.total, burn.bounded ? "upper-bound" : "lanes"];
+    // a week is bursty: pace it by what the lanes running now spend (their tokens, each over half
+    // an hour), or failing that its average so far, not by the window's last minutes
+    if (burn !== null && burn.basis === "tokens" && burn.each > 0) {
+      return [burn.total, "lanes"];
     }
-    const average = windowAverage(w, now);
     return average === null ? [null, null] : [average, "window-average"];
   }
-  const [rate, , , basis] = recentRate(rows, w, now); // held to the same evidence as the lane estimate
+  const [rate, , , basis] = recent; // held to the same evidence as the lane estimate
   // no window-average fallback for short windows: right after a reset it is only the start-up burst
   return [rate, basis];
 }
@@ -166,8 +166,9 @@ function peakRate(
 ): number | null {
   const start = w.resetsAt - w.lengthS;
   const seen = rate === null ? [] : [rate];
-  if (now - start > 3600) {
-    seen.push(w.used / ((now - start) / 3600));
+  const average = windowAverage(w, now);
+  if (average !== null) {
+    seen.push(average);
   }
   const same = sameWindow(rows, w);
   same.forEach((a, i) => {
@@ -320,8 +321,6 @@ interface LaneBurn {
   readonly basis: "tokens" | "shared";
   /** With the tokens basis, each spending lane's burn, highest first. */
   readonly rates: readonly number[] | null;
-  /** Shared out from a recent rate that only bounds the burn from above. */
-  readonly bounded: boolean;
 }
 
 /**
@@ -337,9 +336,9 @@ function laneBurn(
   if (measured && measured.length > 0) {
     // each lane at its own burn; a new lane is taken to burn as the running ones do on average
     const total = measured.reduce((sum, r) => sum + r, 0);
-    return { total, each: total / measured.length, basis: "tokens", rates: measured, bounded: false };
+    return { total, each: total / measured.length, basis: "tokens", rates: measured };
   }
-  const [rate, since, until, basis] = recent;
+  const [rate, since, until] = recent;
   if (!lanes?.active || rate === null || rate <= 0 || since === null || until === null) {
     return null;
   }
@@ -348,7 +347,7 @@ function laneBurn(
     return null; // the lanes over that stretch are not known: the burn cannot be shared out
   }
   const each = rate / mean;
-  return { total: each * lanes.active, each, basis: "shared", rates: null, bounded: basis === "upper-bound" };
+  return { total: each * lanes.active, each, basis: "shared", rates: null };
 }
 
 /**
@@ -579,10 +578,10 @@ export function assess(
     const tokenCost = tokens ? fitTokenCost(r, tokens) : null;
     const measured = tokens && tokenCost ? laneRates(tokens, tokenCost, now) : null;
     const burn = laneBurn(recent, lanes, measured);
-    const [rate, basis] = rateOf(r, w, now, burn);
+    const average = windowAverage(w, now);
+    const [rate, basis] = rateOf(w, recent, average, burn);
     const estimate = basis === "upper-bound" ? null : rate; // a bound can show room left, never on target or over
     const leftH = Math.max(0, (w.resetsAt - now) / 3600);
-    const average = windowAverage(w, now);
     let target: number | Float | null = new Float(options.target);
     let note: string | null = null;
     if (plan === "even" && long !== null && w === short) {
@@ -606,7 +605,8 @@ export function assess(
     const bank = bankPlan(
       w,
       estimate,
-      peakRate(r, w, now, estimate),
+      // the peak is over spans of an hour or more: not a lane's last half hour of tokens
+      peakRate(r, w, now, basis === "lanes" ? null : estimate),
       banks.get(w.name) ?? null,
       options,
       now,
@@ -663,6 +663,7 @@ export function assess(
       lane.laneHours = null;
     } else if (bank && bank.action === "wait") {
       lane.laneHeadroom = 0; // full until it resets on its own
+      lane.laneHours = null;
     } else if (lane.laneHeadroom === null && !bank && projected !== null && projected > 100) {
       lane.laneHeadroom = 0; // no per-lane estimate yet, but already on pace to run out
     }

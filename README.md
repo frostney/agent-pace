@@ -9,7 +9,7 @@ advises: it never redeems a reset.
 $ agent-pace plan
 route spare work to Codex: banked reset expires in 36h and cannot be filled by then (needs 2.4%/h, peak 0.7%/h); fill what you can, then redeem it (lanes: Codex room for ~264 more lanes at 0.3%/h each for 1.0h; Claude measuring: start at most 1-2 new lanes)
   12:25 claude: 5h 6% ? 1.17h left (78.0%/h lands on 97.0%) -> measuring | 7d 40% 0.6%/h (window avg) 96.0h left, ends ~93% (0.6%/h lands on 97.0%) -> keep going (measuring: start at most 1-2 new lanes)
-  12:25 codex: 7d 20% 0.6%/h (lanes, window avg 0.7%/h) 139.81h left, runs out in ~5.6d (2.4%/h lands on 100%) -> room left: add work (room for ~264 more lanes at 0.3%/h each for 1.0h)
+  12:25 codex: 7d 20% 0.7%/h (window avg) 139.81h left, runs out in ~4.8d (2.4%/h lands on 100%) -> room left: add work (room for ~264 more lanes at 0.3%/h each for 1.0h)
     banked reset expires Fri 24 Oct 00:10 (in 35.8h): cannot reach 100% by then (needs 2.4%/h, peak seen 0.7%/h); redeem it anyway by Thu 23 Oct 22:10, an unused reset is lost [3 banked]
 ```
 
@@ -62,8 +62,10 @@ takes it from any link or copy with that name; run from source, only the `claude
 
 Per window: usage, burn rate, time to reset, the projected usage at reset, and the rate that
 lands on `--target`. A short window's burn is its recent rate. A week is bursty, so it is paced
-by what the lanes running now burn ("0.1%/h (lanes, window avg 0.8%/h)"), and by its average so
-far ("window avg") while that is not known or no lane is running. It takes resets into account:
+by what the lanes running now spend, measured from their own tokens ("0.1%/h (lanes, window avg
+0.8%/h)"), and by its average so far ("window avg") while that is not learned or no lane is
+spending. A week's whole points move too seldom for a recent rate to pace it. It takes resets
+into account:
 - When a window rolls over, it says how the finished window ended against the target (for
   example "ended at 96%, 4% unused").
 - `--plan even` caps the short window's target by what the long window can afford: the long
@@ -131,7 +133,7 @@ where the window has room):
   left, never on target or over, and gives no projection). Anything shorter is no estimate,
   nor is a stretch across a drop in use or one whose latest reading is over 10 minutes old.
   The rate a short window's status and projection use is held to the same evidence (a
-  day-long window is paced by its running lanes, or its average).
+  day-long window is paced by its running lanes' tokens, or its average).
 - **Time-weighted lanes:** the lanes are weighted from the counts agent-pace remembers at each
   reading (`lanes-<source>.csv`) and the count now. A count covers the 10 minutes before it,
   back to the count before it, so a count taken before the lanes started does not dilute them.
@@ -157,7 +159,7 @@ where the window has room):
 `--json` adds `active_lanes`, `per_lane_rate`, `lane_headroom`, `lane_hours` (the hours a new
 lane was given) and `lane_binding` (the window whose headroom the source reports) to each
 window, and a `lanes` summary with the same `hours`. `rate_basis` is `lanes` when a week is
-paced by its running lanes, and `window_average_rate` gives the window's average burn beside
+paced by its running lanes' tokens, and `window_average_rate` gives the window's average burn beside
 it. `lane_basis` says
 how the per-lane burn was found (`tokens`, `shared`, or null without one), `lane_rates` lists
 each measured lane's burn, highest first, and `token_cost` gives the learned

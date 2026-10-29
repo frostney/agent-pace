@@ -1,6 +1,7 @@
 // Lane headroom over a finite stretch, which the Python version did not have: a new lane is
 // counted for --lane-hours and then read again, the running lanes until the window resets (or,
-// with a reset banked, until the next reading), and a week is paced by the lanes running now.
+// with a reset banked, until the next reading), and a week is paced by what its running lanes
+// spend (tests/tokens.test.ts).
 // Each case is one the Python version answered with "start nothing new" or "slow down".
 
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
@@ -78,26 +79,35 @@ describe("LaneHours", () => {
     expect(w.lane_hours).toBe(0.5);
   });
 
-  test("a week is paced by the lanes running now, not its window average", async () => {
-    // a week at 88% with 62.9h left: 0.8%/h on average, but the one lane running now burns 0.13%/h
+  test("an unmeasured window with a reset banked binds only if it could fill before the next reading", async () => {
+    // the week at 60% after 50h (1.2%/h on average) has a reset banked and no lane estimate: even at
+    // twice its average it stays far below 100% for the next hour, so the measured 5h window binds
+    const r5 = Math.trunc(NOW + 4200);
+    c.claude.five_hour = { utilization: 6, resets_at: iso(r5) };
+    c.claude.seven_day = { utilization: 60, resets_at: iso(Math.trunc(NOW + 118 * 3600)) };
+    const since = NOW - 0.3 * 3600;
+    c.history("claude", "5h", [[since, 3]], r5);
+    c.laneHistory("claude", every(300, since, NOW, 1));
+    c.claudeLanes(1);
+    c.grant({ ends_at: "2025-12-01T16:00:00+00:00" });
+    const data = await c.json("claude");
+    const week = windows(data)[1] as Fields;
+    expect([week.lane_headroom, (week.banked as Fields).action]).toEqual([null, "fill"]);
+    expect((data.lanes as Fields).window).toBe("5h"); // counted until the week's reset it would hold the source at measuring
+    expect((data.lanes as Fields).headroom).toBe(7);
+  });
+
+  test("a week whose lane burn is only shared out keeps its window average", async () => {
+    // a week at 88% with 62.9h left, 0.8%/h on average: the recent rate of a week's whole points
+    // swings from reading to reading, so only the lanes' own tokens pace it (tests/tokens.test.ts)
     const weekReset = Math.trunc(NOW + 62.9 * 3600);
-    c.claude.five_hour = { utilization: 0, resets_at: iso(Math.trunc(NOW + 4.73 * 3600)) };
     c.claude.seven_day = { utilization: 88, resets_at: iso(weekReset) };
     const since = NOW - (3 / 0.13) * 3600;
     c.history("claude", "7d", [[since, 85]], weekReset);
     c.laneHistory("claude", every(300, since, NOW, 1));
     c.claudeLanes(1);
-    const data = await c.json("claude");
-    const week = windows(data)[1] as Fields;
-    const leftH = week.hours_left as number;
-    expect([week.rate_basis, week.rate_per_hour, week.window_average_rate]).toEqual(["lanes", 0.1, 0.8]);
-    expect(week.status).toBe("on-target"); // by its window average it would end near 141%: slow down
-    expect(week.lane_headroom).toBe(Math.floor((97 - 88 - (0.13 * (weekReset - NOW)) / 3600) / 0.13));
-    expect(week.lane_headroom).toBe(6);
-    expect(leftH).toBe(62.9);
-    const out = await c.claudeOut();
-    expect(out).toContain("7d 88% 0.1%/h (lanes, window avg 0.8%/h) 62.9h left, ends ~96%");
-    expect(out).not.toContain("slow down");
+    const week = windows(await c.json("claude"))[1] as Fields;
+    expect([week.rate_basis, week.status, week.lane_basis]).toEqual(["window-average", "over", "shared"]);
   });
 
   test("a week with no lanes running keeps its window average", async () => {
