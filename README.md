@@ -2,8 +2,9 @@
 
 agent-pace paces AI coding-agent work against your plan's usage windows. It reads Claude Code's
 5-hour and 7-day windows and Codex's windows, projects each one at its reset, counts the banked
-resets on your account, and says how many more agent lanes the headroom supports. It only
-advises: it never redeems a reset.
+resets on your account, and says how many more agent lanes the headroom supports. Once a
+window is at its limit, that headroom is the usage credits you bought, paced against what is
+left of them. It only advises: it never redeems a reset or buys credits.
 
 ```console
 $ agent-pace plan
@@ -19,7 +20,7 @@ Each [release](https://github.com/frostney/agent-pace/releases) has a standalone
 macOS and Linux (arm64 and x64), with `claude-pace` and `codex-pace` links beside it:
 
 ```sh
-version=2.0.0 target=darwin-arm64   # or darwin-x64, linux-x64, linux-arm64
+version=3.0.0 target=darwin-arm64   # or darwin-x64, linux-x64, linux-arm64
 curl -fsSL "https://github.com/frostney/agent-pace/releases/download/v$version/agent-pace-$version-$target.tar.gz" \
   | tar -xz -C ~/.local/bin --strip-components=1 \
       "agent-pace-$version-$target/agent-pace" \
@@ -50,13 +51,14 @@ takes it from any link or copy with that name; run from source, only the `claude
 ### Sources
 
 - **claude:** the Claude Code subscription windows (5-hour and 7-day), the numbers Claude
-  Code's `/usage` shows, and the banked usage-limit resets that Claude Code's `/limit-reset`
-  claims (grants with resets left).
-- **codex:** the Codex CLI windows (for example the weekly window on a ChatGPT plan) and the
-  banked rate-limit resets on the account, read from `codex app-server`
-  (`account/rateLimits/read`, read only). If the app server is not available, the windows come
-  from the rate-limit snapshots Codex writes into its own session logs (as fresh as your last
-  Codex turn) and the banked resets are reported as unknown.
+  Code's `/usage` shows, the banked usage-limit resets that Claude Code's `/limit-reset`
+  claims (grants with resets left), and the usage credits that `/usage-credits` buys (extra
+  usage: the spend limit, what is spent, and the prepaid balance).
+- **codex:** the Codex CLI windows (for example the weekly window on a ChatGPT plan), the
+  banked rate-limit resets on the account and its Codex credits, read from `codex app-server`
+  (`account/rateLimits/read`, read only). If the app server is not available, the windows and
+  credits come from the rate-limit snapshots Codex writes into its own session logs (as fresh
+  as your last Codex turn) and the banked resets are reported as unknown.
 
 ### What it reports
 
@@ -158,12 +160,50 @@ where the window has room):
 
 `--json` adds `active_lanes`, `per_lane_rate`, `lane_headroom`, `lane_hours` (the hours a new
 lane was given) and `lane_binding` (the window whose headroom the source reports) to each
-window, and a `lanes` summary with the same `hours`. `rate_basis` is `lanes` when a week is
-paced by its running lanes' tokens, and `window_average_rate` gives the window's average burn beside
+window, and a `lanes` summary with the same `hours` and the `pool` the lanes draw on: `plan`,
+or `usage-credits` once a window is at its limit (then its headroom and per-lane rate are the
+credits', in their unit; see [Usage credits](#usage-credits)). `rate_basis` is `lanes` when a
+week is paced by its running lanes' tokens, and `window_average_rate` gives the window's average burn beside
 it. `lane_basis` says
 how the per-lane burn was found (`tokens`, `shared`, or null without one), `lane_rates` lists
 each measured lane's burn, highest first, and `token_cost` gives the learned
 `points_per_dollar` with the `runs`, `points` and `dollars` it was learned from.
+
+### Usage credits
+
+Usage credits keep work going once a window is at its limit: Claude's extra usage (bought with
+`/usage-credits`, up to the spend limit) and Codex credits. They are money, so agent-pace paces
+the lanes against what is left of them, and says that is the pool they draw on:
+
+```console
+$ agent-pace claude
+12:25 claude: 5h 6% ? 1.17h left (78.0%/h lands on 97.0%) -> measuring | 7d 100% 0.6%/h (window avg) 6.0h left, runs out in ~0.0h, even pace 0.0%/day -> on usage credits (429.39 GBP left): room for ~2 more lanes at 30.00 GBP/h each for 1.0h
+```
+
+- **Left:** for Claude, the room under the spend limit or the prepaid balance, whichever is
+  less (Claude Code's own sum), in the account's currency. With auto-reload on, the balance
+  does not cap it; with no spend limit as well, nothing does ("no spend limit"). Extra usage
+  turned off, or turned off because the credits ran out or the limit was reached, is no
+  credits. For Codex, the credit balance; unlimited credits have nothing that caps them.
+- **When they count:** only while a window is at 100% with no lane headroom, until the windows
+  at their limit have reset. Below the limit, or with no credits left, the lanes read as
+  before ("no lane headroom: start nothing new").
+- **Draw:** agent-pace records what the credits have spent at each reading
+  (`<source>-credits.csv`) and measures their draw as it measures a window's recent burn: over
+  the latest stretch of at least 9 minutes in which at least 3 units were spent, shared out
+  over the lanes active meanwhile. It is in the credits' own unit, so no exchange rate or price
+  list comes into it.
+- **Lanes supported** = (left - running draw * hours to the reset) / (per-lane draw * lane
+  hours), rounded down, not below 0: the running lanes draw until the window resets, a new one
+  for `--lane-hours`. Until the draw is measured, or with nothing capping the credits, it says
+  "measuring" and suggests at most 1-2 new lanes.
+- **plan** still routes spare work to a provider with room in its plan first, since credits
+  cost money. When neither plan has room, it routes work to the provider with credits ("route
+  work to Claude on usage credits (429.39 GBP left), or wait for a reset").
+
+`--json` adds `usage_credits` to each source (null without credits to draw on): `unit`, `left`
+(null when nothing caps it), `drawing`, `hours_left`, `rate_per_hour`, `per_lane_rate`,
+`lane_headroom` and `lane_hours`.
 
 ### Points per dollar
 
@@ -222,8 +262,8 @@ more lanes each provider supports. It changes nothing.
 
 agent-pace keeps its history in `~/.local/state/agent-pace/`: one CSV per source and window
 (`claude-5h.csv`, `codex-7d.csv`: observed at, used, resets at), the lane counts
-(`lanes-<source>.csv`), the Claude banked resets from the last reading
-(`claude-banked.json`), and what each lane spent per minute over the last eight days with how far
+(`lanes-<source>.csv`), what the usage credits have spent (`<source>-credits.csv`), the Claude
+banked resets and credits from the last reading (`claude-banked.json`), and what each lane spent per minute over the last eight days with how far
 each session file has been read (`tokens-<source>.json`). The first reading reads the last
 eight days of session files, a few seconds for a busy week; later readings read only what was
 appended. Claude readings are shared per machine through a lock and a one-minute
@@ -237,8 +277,13 @@ Claude credentials come from `$CLAUDE_CODE_OAUTH_TOKEN`, then the macOS Keychain
 run `claude` once.
 
 The Claude endpoint (`https://api.anthropic.com/api/oauth/usage`) is the one Claude Code's
-`/usage` uses; it is not a documented public API. One call, with `?cedar_ember=1&skip_spend=1`,
-also returns the banked resets (`cedar_ember`). The server only evaluates those for the Claude
+`/usage` uses; it is not a documented public API. One call, with `?cedar_ember=1`, also
+returns the banked resets (`cedar_ember`) and the extra usage (`extra_usage`, which
+`skip_spend=1` would leave out). With extra usage on, a second call reads the prepaid balance
+(`/api/oauth/organizations/<org>/prepaid/credits`, as `/usage-credits` does), for the
+organization in `$CLAUDE_CODE_ORGANIZATION_UUID` or Claude Code's config
+(`oauthAccount.organizationUuid` in `$CLAUDE_CONFIG_DIR/.claude.json`, default
+`~/.claude.json`). If it cannot be read, the credits are unknown and the pacing is as before. The server only evaluates those for the Claude
 Code surface, so the request identifies itself as the installed Claude Code (User-Agent
 `claude-cli/<version> (external, cli)`, `x-app: cli`; the version comes from
 `claude --version`, remembered for a day, else a built-in one). That is fragile: if the server
@@ -253,10 +298,11 @@ always terminated); the fallback snapshots come from `$CODEX_HOME/sessions` (def
 
 agent-pace 1.4 was a Python script. This TypeScript version prints the same text and `--json`
 digit for digit, takes the same flags, and reads and writes the same state files, so a history
-the Python version kept carries over. Three things are new: the measured per-lane burn, which
+the Python version kept carries over. Four things are new: the measured per-lane burn, which
 changes the lane numbers once points per dollar are learned; lane headroom over
 `--lane-hours` with a week paced by its running lanes (2.0), which changes the lane numbers, a
-week's rate and status, and the lane wording; and the `--json` fields that describe them.
+week's rate and status, and the lane wording; usage credits (3.0), which give a window at its
+limit lane headroom on the credits; and the `--json` fields and state files that describe them.
 Otherwise they differ only here:
 - Failures the operating system reports use urllib's and OSError's frames (`<urlopen error
   ...>`, `[Errno 2] No such file or directory: ...`); a refused connection and an unknown host

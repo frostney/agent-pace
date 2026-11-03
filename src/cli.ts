@@ -46,6 +46,7 @@ async function pace(source: Source, options: Options, host: Host): Promise<numbe
         reading.lanes,
         now,
         reading.tokens,
+        reading.credits,
       );
       let messages = rollovers(source, res, seen);
       if (first) {

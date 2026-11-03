@@ -1,6 +1,9 @@
 import {
   type BankAdvice,
+  type CreditPlan,
+  creditsOf,
   laneSummary,
+  laneSupply,
   type RateBasis,
   redeeming,
   type Status,
@@ -13,17 +16,32 @@ import { float, type Json, type JsonObject } from "./python-json.ts";
 import { isoOrNull, localClock, localStamp, parseIso } from "./time-format.ts";
 import type { Reading, ReadingWithLanes, Source } from "./usage.ts";
 
-/** What the lane headroom says, as advice. */
+/** An amount of usage credits with its unit, such as "429.39 GBP". */
+export function creditAmount(x: number, credits: CreditPlan): string {
+  return `${formatFixed(x, credits.places)} ${credits.unit}`;
+}
+
+/** The pool the lanes draw on once a window is at its limit, such as "on usage credits (429.39 GBP left)". */
+export function creditPool(credits: CreditPlan): string {
+  return credits.left === null
+    ? "on usage credits (no spend limit)"
+    : `on usage credits (${creditAmount(credits.left, credits)} left)`;
+}
+
+/** What the lane headroom says, as advice; drawing on usage credits, which pool it is. */
 export function lanePhrase(res: readonly WindowAssessment[]): string {
-  const [more, per, , hours] = laneSummary(res);
+  const [more, per, , hours, pool] = laneSupply(res);
+  const credits = creditsOf(res);
+  const paid = pool === "usage-credits" ? credits : null;
+  const lead = paid ? `${creditPool(paid)}: ` : "";
   if (more === null) {
-    return "measuring: start at most 1-2 new lanes";
+    return `${lead}measuring: start at most 1-2 new lanes`;
   }
   if (more === 0) {
-    return "no lane headroom: start nothing new";
+    return `${lead}no lane headroom: start nothing new`;
   }
-  const each = `at ${per === null ? "None" : floatRepr(per)}%/h each`;
-  return `room for ~${more} more lane${more > 1 ? "s" : ""} ${each}${hours === null ? "" : ` for ${floatRepr(hours)}h`}`;
+  const rate = per === null ? "None" : paid ? `${creditAmount(per, paid)}/h` : `${floatRepr(per)}%/h`;
+  return `${lead}room for ~${more} more lane${more > 1 ? "s" : ""} at ${rate} each${hours === null ? "" : ` for ${floatRepr(hours)}h`}`;
 }
 
 const ADVICE: Record<Status, string> = {
@@ -74,6 +92,8 @@ export function render(
     const phrase = lanePhrase(res);
     if (redeeming(a.banked)) {
       // the line below says to redeem; lanes come after
+    } else if (a.laneBinding && a.credits?.drawing) {
+      advice = phrase; // the plan is full: the lanes draw on the usage credits now
     } else if (a.status === "under" && more === 0) {
       advice = phrase; // room left, but not for another lane
     } else if (a.laneBinding && a.status !== "over") {
@@ -186,13 +206,32 @@ export function bankedJson(reading: Reading): JsonObject {
 }
 
 export function lanesJson(res: readonly WindowAssessment[]): JsonObject {
-  const [more, per, window, hours] = laneSummary(res);
+  const [more, per, window, hours, pool] = laneSupply(res);
   return {
     active: res[0]?.activeLanes ?? 0,
     headroom: more,
     per_lane_rate: float(per),
     window,
     hours: float(hours),
+    pool,
+  };
+}
+
+/** The usage credits as --json reports them; null without credits to draw on. */
+export function creditsJson(res: readonly WindowAssessment[]): Json {
+  const c = creditsOf(res);
+  if (c === null) {
+    return null;
+  }
+  return {
+    unit: c.unit,
+    left: float(c.left),
+    drawing: c.drawing,
+    hours_left: float(c.hoursLeft),
+    rate_per_hour: float(c.ratePerHour),
+    per_lane_rate: float(c.perLaneRate),
+    lane_headroom: c.laneHeadroom,
+    lane_hours: float(c.laneHours),
   };
 }
 
@@ -258,7 +297,12 @@ export function windowJson(a: WindowAssessment): JsonObject {
 
 /** One source's reading as --json reports it. */
 export function sourceJson(reading: ReadingWithLanes, res: readonly WindowAssessment[]): JsonObject {
-  return { windows: res.map(windowJson), banked_resets: bankedJson(reading), lanes: lanesJson(res) };
+  return {
+    windows: res.map(windowJson),
+    banked_resets: bankedJson(reading),
+    lanes: lanesJson(res),
+    usage_credits: creditsJson(res),
+  };
 }
 
 /** The lines under a source's reading: what to do with its banked resets, then its note. */

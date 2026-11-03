@@ -1,11 +1,11 @@
 import { EVIDENCE_ERROR, EVIDENCE_POINTS, USE_STEP } from "./evidence.ts";
-import { type HistoryRow, logPath, RESET_JITTER_S, read } from "./history.ts";
+import { CREDITS_LOG, type HistoryRow, logPath, RESET_JITTER_S, read } from "./history.ts";
 import { LANE_IDLE_S } from "./lanes.ts";
 import { Float, formatFixed, roundTo, roundToInt } from "./python-format.ts";
 import { isoOrNull, isoUtc } from "./time-format.ts";
 import { fitTokenCost, laneRates, type TokenCost } from "./token-burn.ts";
 import type { TokenUse } from "./token-ledger.ts";
-import type { Banked, Credit, LaneReading, Source, UsageWindow } from "./usage.ts";
+import type { Banked, Credit, LaneReading, Source, UsageCredits, UsageWindow } from "./usage.ts";
 
 export type PlanMode = "fill" | "even";
 
@@ -56,6 +56,26 @@ export interface LanePlan {
   laneHours: number | null;
 }
 
+/**
+ * The lanes the usage credits support once a window is at its limit, when new work draws on
+ * the credits until the full windows reset. Amounts are in the credits' unit.
+ */
+export interface CreditPlan {
+  readonly unit: string;
+  readonly places: number;
+  /** What is left to spend; null when nothing caps it. */
+  readonly left: number | null;
+  /** Whether a window is at its limit with no lane headroom, so new work draws on the credits. */
+  readonly drawing: boolean;
+  /** The hours until the windows at their limit have all reset; null while not drawing. */
+  readonly hoursLeft: number | null;
+  /** What the running lanes draw (unit/h). */
+  readonly ratePerHour: number | null;
+  readonly perLaneRate: number | null;
+  readonly laneHeadroom: number | null;
+  readonly laneHours: number | null;
+}
+
 /** One window's assessment; --json reports it field for field. */
 export interface WindowAssessment extends LanePlan {
   readonly window: string;
@@ -79,6 +99,8 @@ export interface WindowAssessment extends LanePlan {
   readonly observedAt: string;
   /** Points of this window a dollar of local spending has been worth; null while unlearned. */
   readonly tokenCost: TokenCost | null;
+  /** On the binding window: what the usage credits support; null elsewhere and without credits. */
+  credits: CreditPlan | null;
 }
 
 const sameWindow = (rows: readonly HistoryRow[], w: UsageWindow) =>
@@ -546,6 +568,63 @@ function bindingLane(out: readonly WindowAssessment[], roomy: ReadonlySet<string
   return best;
 }
 
+/**
+ * What the usage credits support. Credits pay for work once a window is at its limit, until it
+ * resets, so they count only when a window is at 100% with no lane headroom; then the lanes
+ * are paced against what is left, as a window's headroom is against its aim:
+ *
+ *     supported lanes = (left - running draw * hours to the reset) / (per-lane draw * lane hours)
+ *
+ * The draw is measured from the credits' own history (`<source>-credits.csv`) with the evidence
+ * a window's recent burn needs, and shared out over the lanes active meanwhile; it is in the
+ * credits' own unit, so no exchange rate or price list comes into it. Without a measured draw,
+ * or with nothing capping the credits, there is no count ("measuring"). Null without credits
+ * to draw on, so a window at its limit with none left reads as before.
+ */
+function creditPlan(
+  out: readonly WindowAssessment[],
+  credits: UsageCredits | null,
+  rows: readonly HistoryRow[],
+  lanes: LaneReading | null,
+  options: PaceOptions,
+  now: number,
+): CreditPlan | null {
+  if (credits === null || (credits.left !== null && credits.left <= 0)) {
+    return null;
+  }
+  const full = out.filter((a) => a.used >= 100 && a.laneHeadroom === 0);
+  const plan: CreditPlan = {
+    unit: credits.unit,
+    places: credits.places,
+    left: credits.left,
+    drawing: full.length > 0,
+    hoursLeft: null,
+    ratePerHour: null,
+    perLaneRate: null,
+    laneHeadroom: null,
+    laneHours: null,
+  };
+  if (!plan.drawing) {
+    return plan;
+  }
+  const leftH = Math.max(...full.map((a) => a.hoursLeft));
+  // the credits as a window with no reset: a spend counter, never bounded from above by its length
+  const counter = { name: CREDITS_LOG, used: credits.spent, resetsAt: 0, lengthS: Infinity, observedAt: now };
+  const recent = recentRate(rows, counter, now);
+  const burn = laneBurn(recent, lanes, null);
+  const newH = Math.min(options.laneHours, leftH);
+  const measured = { ...plan, hoursLeft: roundTo(leftH, 2), ratePerHour: recent[0] && roundTo(recent[0], 2) };
+  if (credits.left === null || burn === null || !(burn.each > 0) || newH <= 0.05) {
+    return measured; // nothing caps the credits, or their draw is not measured yet
+  }
+  return {
+    ...measured,
+    perLaneRate: roundTo(burn.each, 2),
+    laneHeadroom: Math.max(0, Math.floor((credits.left - burn.total * leftH) / (burn.each * newH))),
+    laneHours: roundTo(newH, 2),
+  };
+}
+
 export function assess(
   source: Source,
   windows: readonly UsageWindow[],
@@ -554,6 +633,7 @@ export function assess(
   lanes: LaneReading | null,
   now: number,
   tokens: TokenUse | null = null,
+  credits: UsageCredits | null = null,
 ): WindowAssessment[] {
   const out: WindowAssessment[] = [];
   const roomy = new Set<string>();
@@ -686,13 +766,43 @@ export function assess(
       laneBinding: false,
       observedAt: isoUtc(w.observedAt),
       tokenCost,
+      credits: null,
     });
     if (farBelow(w, aim, runningH, now)) {
       roomy.add(w.name);
     }
   }
-  bindingLane(out, roomy).laneBinding = true;
+  const binding = bindingLane(out, roomy);
+  binding.laneBinding = true;
+  binding.credits = creditPlan(
+    out,
+    credits,
+    read(logPath(options.state, source, CREDITS_LOG)),
+    lanes,
+    options,
+    now,
+  );
   return out;
+}
+
+/** The usage credits of one source's assessment; null without credits. */
+export function creditsOf(res: readonly WindowAssessment[]): CreditPlan | null {
+  return res.find((x) => x.laneBinding)?.credits ?? null;
+}
+
+/**
+ * The lanes one source supports and the pool they draw on: the plan's windows, or the usage
+ * credits once a window is at its limit; [more lanes, per-lane rate, window, hours, pool].
+ */
+export function laneSupply(
+  res: readonly WindowAssessment[],
+): [number | null, number | null, string, number | null, "plan" | "usage-credits"] {
+  const [more, per, window, hours] = laneSummary(res);
+  const credits = creditsOf(res);
+  if (credits?.drawing) {
+    return [credits.laneHeadroom, credits.perLaneRate, window, credits.laneHours, "usage-credits"];
+  }
+  return [more, per, window, hours, "plan"];
 }
 
 /**

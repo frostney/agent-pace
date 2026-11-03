@@ -297,7 +297,7 @@ describe("ClaudeBankedResets", () => {
   test("the request is the one claude code makes", async () => {
     await c.claudeOut();
     const req = c.requests[0];
-    expect(req?.url).toBe("https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1");
+    expect(req?.url).toBe("https://api.anthropic.com/api/oauth/usage?cedar_ember=1");
     expect(req?.headers.get("user-agent")).toBe("claude-cli/2.1.999 (external, cli)");
     expect(req?.headers.get("x-app")).toBe("cli");
     expect(c.requests.length).toBe(1);
@@ -620,6 +620,7 @@ describe("Lanes", () => {
       per_lane_rate: 0.3,
       window: "7d",
       hours: 1,
+      pool: "plan",
     });
   });
 
@@ -655,7 +656,14 @@ describe("Lanes", () => {
     expect(out).not.toContain("room left"); // the 5h window alone would invite work
     expect(out.split("no lane headroom: start nothing new").length - 1).toBe(2);
     const data = await c.json("claude", "--state", c.copyState());
-    expect(data.lanes).toEqual({ active: 2, headroom: 0, per_lane_rate: 0.6, window: "7d", hours: 1 });
+    expect(data.lanes).toEqual({
+      active: 2,
+      headroom: 0,
+      per_lane_rate: 0.6,
+      window: "7d",
+      hours: 1,
+      pool: "plan",
+    });
     const [five, seven] = windows(data) as [Json, Json];
     expect(five.lane_headroom as number).toBeGreaterThan(0);
     expect([seven.lane_headroom, seven.lane_binding, five.status]).toEqual([0, true, "under"]);
@@ -1177,7 +1185,14 @@ describe("Replay", () => {
     const [text, data] = (await replay())[1] as [string, Json]; // 08:21:52
     expect(text).not.toContain("no lane headroom");
     expect(text).toContain("measuring: start at most 1-2 new lanes");
-    expect(data.lanes).toEqual({ active: 4, headroom: null, per_lane_rate: null, window: "5h", hours: null });
+    expect(data.lanes).toEqual({
+      active: 4,
+      headroom: null,
+      per_lane_rate: null,
+      window: "5h",
+      hours: null,
+      pool: "plan",
+    });
   });
 
   test("three points measure the lanes and the flat week does not bind", async () => {
@@ -1193,7 +1208,14 @@ describe("Replay", () => {
     // the five running lanes go on until the 5h reset, a new one for an hour
     const per = rate / lanes;
     expect(five.lane_headroom).toBe(Math.floor((97 - 7 - per * 5 * (five.hours_left as number)) / per));
-    expect(data.lanes).toEqual({ active: 5, headroom: 25, per_lane_rate: 1.85, window: "5h", hours: 1 });
+    expect(data.lanes).toEqual({
+      active: 5,
+      headroom: 25,
+      per_lane_rate: 1.85,
+      window: "5h",
+      hours: 1,
+      pool: "plan",
+    });
     expect([week.used, week.lane_headroom, week.lane_binding]).toEqual([9, null, false]);
     expect(text).toContain("room for ~25 more lanes at 1.85%/h each for 1.0h");
   });

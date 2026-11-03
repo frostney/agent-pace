@@ -17,7 +17,7 @@ import {
   truthy,
 } from "./python-json.ts";
 import { parseIso } from "./time-format.ts";
-import type { Banked, Credit, UsageWindow, Via } from "./usage.ts";
+import type { Banked, Credit, UsageCredits, UsageWindow, Via } from "./usage.ts";
 import { VERSION } from "./version.ts";
 
 /** A Codex window; one whose snapshot has already reset restarts from zero. */
@@ -84,8 +84,35 @@ function rolloutFiles(root: string): string[] {
 
 const mtime = (path: string) => statSync(path).mtimeMs / 1000;
 
-/** The windows of the newest rate-limit snapshot in the Codex session logs. */
-export function codexWindows(host: Host): UsageWindow[] {
+/**
+ * The Codex credits in a rate-limit snapshot's credits block (hasCredits from the app server,
+ * has_credits in the session logs); null without a balance to go by. The balance is a decimal
+ * string of credits; unlimited credits have nothing that caps them.
+ */
+export function codexCredits(block: unknown): UsageCredits | null {
+  if (!isRecord(block)) {
+    return null;
+  }
+  const has = or(get(block, "hasCredits"), () => get(block, "has_credits"));
+  const balance = get(block, "balance");
+  const amount =
+    typeof balance === "string" && /^\s*-?\d+(\.\d+)?\s*$/.test(balance)
+      ? Number(balance)
+      : typeof balance === "boolean"
+        ? null
+        : numericValue(balance);
+  const unlimited = get(block, "unlimited") === true;
+  if (amount === null && !unlimited) {
+    return null;
+  }
+  // spending lowers the balance; a top-up raises it, which reads as a drop in what is spent
+  const spent = amount === null ? 0 : 0 - amount; // not -0 for an empty balance
+  const left = unlimited ? null : has === true ? Math.max(0, amount ?? 0) : 0;
+  return { left, spent, unit: "credits", places: 2 };
+}
+
+/** The windows and credits of the newest rate-limit snapshot in the Codex session logs. */
+export function codexWindows(host: Host): { windows: UsageWindow[]; credits: UsageCredits | null } {
   const files = rolloutFiles(join(codexHome(host.env), "sessions"))
     .map((path) => ({ path, mtime: mtime(path) }))
     .sort((a, b) => b.mtime - a.mtime)
@@ -155,7 +182,10 @@ export function codexWindows(host: Host): UsageWindow[] {
   if (out.length === 0) {
     throw new ExitError("agent-pace: the Codex snapshot has no usage windows");
   }
-  return out.sort((a, b) => a.lengthS - b.lengthS);
+  return {
+    windows: out.sort((a, b) => a.lengthS - b.lengthS),
+    credits: codexCredits(get(limits, "credits")),
+  };
 }
 
 /** Lines from a process's stdout, each awaited until a deadline. */
@@ -330,7 +360,7 @@ export function codexAppServerReading(
   result: Record<string, unknown>,
   observed: number,
   now: number,
-): { windows: UsageWindow[] | null; banked: Banked | null } {
+): { windows: UsageWindow[] | null; banked: Banked | null; credits: UsageCredits | null } {
   const byId = get(result, "rateLimitsByLimitId");
   const snap = or(isRecord(byId) ? get(byId, "codex") : null, () => get(result, "rateLimits"));
   const windows: UsageWindow[] = [];
@@ -371,13 +401,14 @@ export function codexAppServerReading(
     banked = { count: Number(available), credits };
   }
   windows.sort((a, b) => a.lengthS - b.lengthS);
-  return { windows: windows.length > 0 ? windows : null, banked };
+  const credits = isRecord(snap) ? codexCredits(get(snap, "credits")) : null;
+  return { windows: windows.length > 0 ? windows : null, banked, credits };
 }
 
 /** Windows and banked resets from the app server; the session logs (resets unknown) if it fails. */
 export async function codexReading(
   host: Host,
-): Promise<{ windows: UsageWindow[]; banked: Banked | null; via: Via }> {
+): Promise<{ windows: UsageWindow[]; banked: Banked | null; via: Via; credits: UsageCredits | null }> {
   const now = host.now();
   const result = await codexAppServer(host);
   if (result !== null) {
@@ -392,8 +423,13 @@ export async function codexReading(
       reading = null;
     }
     if (reading?.windows) {
-      return { windows: reading.windows, banked: reading.banked, via: "app-server" };
+      return {
+        windows: reading.windows,
+        banked: reading.banked,
+        via: "app-server",
+        credits: reading.credits,
+      };
     }
   }
-  return { windows: codexWindows(host), banked: null, via: "session-logs" };
+  return { ...codexWindows(host), banked: null, via: "session-logs" };
 }

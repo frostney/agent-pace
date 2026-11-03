@@ -1,10 +1,26 @@
-import { assess, laneSummary, type PaceOptions, tooLateToFill, type WindowAssessment } from "./assess.ts";
+import {
+  assess,
+  creditsOf,
+  laneSupply,
+  type PaceOptions,
+  tooLateToFill,
+  type WindowAssessment,
+} from "./assess.ts";
 import { ExitError, RateLimited, survivableErrorText } from "./errors.ts";
 import type { Host } from "./host.ts";
 import { formatFixed } from "./python-format.ts";
 import { dumps, type JsonObject } from "./python-json.ts";
 import { readSource } from "./readings.ts";
-import { lanePhrase, noteLines, perHour, redeemIt, render, sourceJson, Wording } from "./report.ts";
+import {
+  creditPool,
+  lanePhrase,
+  noteLines,
+  perHour,
+  redeemIt,
+  render,
+  sourceJson,
+  Wording,
+} from "./report.ts";
 import { type ReadingWithLanes, SOURCES, type Source } from "./usage.ts";
 
 export const NAMES: Record<Source, string> = { claude: "Claude", codex: "Codex" };
@@ -140,6 +156,11 @@ export function recommend(
     return [first, false, text];
   }
   const cold = read.filter((src) => !hot[src]);
+  // a full plan whose work can go on on usage credits: room, at a price
+  const paid = (src: Source) => {
+    const credits = creditsOf(readings[src] ?? []);
+    return credits?.drawing && credits.laneHeadroom !== 0 ? credits : null;
+  };
   for (const src of hotSources) {
     if (!hot[src]) {
       continue;
@@ -148,18 +169,18 @@ export function recommend(
     if (cold.includes(other)) {
       return [other, false, `${NAMES[src]} ${notes(src)}: route work to ${NAMES[other]}`];
     }
+    const payer = [src, other].find((s) => hot[s] && paid(s));
+    const credits = payer ? paid(payer) : null;
+    const onCredits =
+      payer && credits ? `route work to ${NAMES[payer]} ${creditPool(credits)}, or wait for a reset` : null;
     if (hot[other]) {
-      return [
-        "none",
-        false,
-        `${NAMES.claude} ${notes("claude")} and ${NAMES.codex} ${notes("codex")}: neither has room, wait for a reset`,
-      ];
+      const both = `${NAMES.claude} ${notes("claude")} and ${NAMES.codex} ${notes("codex")}`;
+      return payer && onCredits
+        ? [payer, false, `${both}: neither plan has room; ${onCredits}`]
+        : ["none", false, `${both}: neither has room, wait for a reset`];
     }
-    return [
-      "none",
-      false,
-      `${NAMES[src]} ${notes(src)}, and ${NAMES[other]} could not be read (${errors[other] ?? "None"})`,
-    ];
+    const unread = `${NAMES[src]} ${notes(src)}, and ${NAMES[other]} could not be read (${errors[other] ?? "None"})`;
+    return payer && onCredits ? [payer, false, `${unread}; ${onCredits}`] : ["none", false, unread];
   }
   const failed = SOURCES.filter((s) => errors[s] !== undefined);
   if (failed.length > 0) {
@@ -206,6 +227,7 @@ export async function runPlan(options: PaceOptions & { readonly json: boolean },
         reading.lanes,
         host.now(),
         reading.tokens,
+        reading.credits,
       );
       read.push({ source, reading, res });
     } catch (error) {
@@ -223,7 +245,7 @@ export async function runPlan(options: PaceOptions & { readonly json: boolean },
   const routed = read.find((r) => r.source === route);
   if (routed && !redeem) {
     // work is going somewhere: say how many lanes each provider can take
-    if (laneSummary(routed.res)[0] === 0) {
+    if (laneSupply(routed.res)[0] === 0) {
       text += ` - but ${NAMES[routed.source]} has no lane headroom right now`;
     }
     const order = [routed, ...read.filter((r) => r !== routed)];
