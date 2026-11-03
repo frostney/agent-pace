@@ -33,6 +33,20 @@ export interface LaneReading {
   readonly at: number;
 }
 
+/**
+ * The usage credits on an account: what it can keep spending once a window is at its limit
+ * (Claude's extra usage, Codex credits). Amounts are in `unit`: a currency, or Codex credits.
+ */
+export interface UsageCredits {
+  /** What is left to spend; null when nothing caps it. */
+  readonly left: number | null;
+  /** A counter that rises as the credits are drawn, for measuring the draw (a top-up or a new month can lower it). */
+  readonly spent: number;
+  readonly unit: string;
+  /** The decimal places the amounts are shown with. */
+  readonly places: number;
+}
+
 export type Via = "usage-api" | "app-server" | "session-logs";
 
 /** A source's reading: its windows and banked resets (null when they cannot be known). */
@@ -41,6 +55,8 @@ export interface Reading {
   readonly banked: Banked | null;
   readonly note: string | null;
   readonly via: Via;
+  /** The usage credits; null when the account has none to draw on, or they cannot be known. */
+  readonly credits: UsageCredits | null;
 }
 
 export interface ReadingWithLanes extends Reading {

@@ -3,12 +3,20 @@ import { join } from "node:path";
 import { CLAUDE_WINDOWS, claudeReading } from "./claude.ts";
 import { codexReading } from "./codex.ts";
 import { withLock } from "./file-lock.ts";
-import { logPath, read, record } from "./history.ts";
+import { CREDITS_LOG, logPath, read, record } from "./history.ts";
 import type { Host } from "./host.ts";
 import { laneReading } from "./lanes.ts";
 import { dumps, float, isRecord, type Json } from "./python-json.ts";
 import { tokenReading } from "./token-ledger.ts";
-import type { Banked, Credit, Reading, ReadingWithLanes, Source, UsageWindow } from "./usage.ts";
+import type {
+  Banked,
+  Credit,
+  Reading,
+  ReadingWithLanes,
+  Source,
+  UsageCredits,
+  UsageWindow,
+} from "./usage.ts";
 
 /** The banked resets as the sidecar file holds them (Python's json.dump of the same dict). */
 export function bankedRecord(banked: Banked | null): Json {
@@ -58,27 +66,74 @@ function parseBanked(value: unknown): Banked | null {
   return { count: value.count, credits: credits.filter((c): c is Credit => c !== null) };
 }
 
-/** The banked resets stored with the last reading (the history only holds windows). */
-function readSidecar(state: string, source: Source): Pick<Reading, "banked" | "note"> {
+/** The usage credits as the sidecar file holds them. */
+function creditsRecord(credits: UsageCredits | null): Json {
+  if (credits === null) {
+    return null;
+  }
+  return {
+    left: float(credits.left),
+    spent: float(credits.spent),
+    unit: credits.unit,
+    places: credits.places,
+  };
+}
+
+function parseCredits(value: unknown): UsageCredits | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const { left, spent, unit, places } = value;
+  if ((left !== null && typeof left !== "number") || typeof spent !== "number" || typeof unit !== "string") {
+    return null;
+  }
+  return { left, spent, unit, places: typeof places === "number" ? places : 2 };
+}
+
+/** The banked resets and credits stored with the last reading (the history only holds windows). */
+function readSidecar(state: string, source: Source): Pick<Reading, "banked" | "note" | "credits"> {
   try {
     const side: unknown = JSON.parse(readFileSync(join(state, `${source}-banked.json`), "utf8"));
     if (isRecord(side)) {
       const note = typeof side.note === "string" ? side.note : null;
-      return { banked: parseBanked(side.banked), note };
+      return { banked: parseBanked(side.banked), note, credits: parseCredits(side.credits) };
     }
   } catch {
     // no sidecar yet
   }
-  return { banked: null, note: null };
+  return { banked: null, note: null, credits: null };
 }
 
 function writeSidecar(state: string, source: Source, reading: Reading): void {
   const path = join(state, `${source}-banked.json`);
   try {
-    writeFileSync(`${path}.tmp`, dumps({ banked: bankedRecord(reading.banked), note: reading.note }));
+    const side = {
+      banked: bankedRecord(reading.banked),
+      note: reading.note,
+      credits: creditsRecord(reading.credits),
+    };
+    writeFileSync(`${path}.tmp`, dumps(side));
     renameSync(`${path}.tmp`, path);
   } catch {
     // the next reading stores them
+  }
+}
+
+/** What the credits have spent, kept beside the windows so their draw can be measured as a window's burn is. */
+function recordCredits(
+  state: string,
+  source: Source,
+  credits: UsageCredits | null,
+  at: number,
+  minGap = 0,
+): void {
+  if (credits !== null) {
+    record(
+      state,
+      source,
+      { name: CREDITS_LOG, used: credits.spent, resetsAt: 0, lengthS: 0, observedAt: at },
+      minGap,
+    );
   }
 }
 
@@ -116,6 +171,7 @@ async function fetchShared(
     for (const w of reading.windows) {
       record(state, source, w);
     }
+    recordCredits(state, source, reading.credits, host.now());
     writeSidecar(state, source, reading);
     return reading;
   });
@@ -131,10 +187,11 @@ async function readClaude(state: string, host: Host): Promise<ReadingWithLanes> 
 }
 
 async function readCodex(state: string, host: Host): Promise<ReadingWithLanes> {
-  const { windows, banked, via } = await codexReading(host);
+  const { windows, banked, via, credits } = await codexReading(host);
   for (const w of windows) {
     record(state, "codex", w, 60); // a reading per call, but at most a row a minute
   }
+  recordCredits(state, "codex", credits, windows[0]?.observedAt ?? host.now(), 60);
   let note: string | null = null;
   if (banked === null) {
     note =
@@ -147,6 +204,7 @@ async function readCodex(state: string, host: Host): Promise<ReadingWithLanes> {
     banked,
     note,
     via,
+    credits,
     lanes: await laneReading(state, "codex", host),
     tokens: await tokenReading(state, "codex", host),
   };

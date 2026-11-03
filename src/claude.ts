@@ -2,12 +2,25 @@ import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { constants } from "node:os";
 import { join } from "node:path";
 import { ExitError, NetworkError, RateLimited } from "./errors.ts";
-import { claudeHome, commandLine, type Host } from "./host.ts";
-import { get, isPythonInt, isRecord, items, type Json, parseJson, toFloat, truthy } from "./python-json.ts";
+import { claudeHome, commandLine, type Host, homeDirectory } from "./host.ts";
+import {
+  get,
+  isPythonInt,
+  isRecord,
+  items,
+  type Json,
+  numericValue,
+  parseJson,
+  toFloat,
+  truthy,
+} from "./python-json.ts";
 import { parseIso } from "./time-format.ts";
-import type { Banked, Credit, Reading, UsageWindow } from "./usage.ts";
+import type { Banked, Credit, Reading, UsageCredits, UsageWindow } from "./usage.ts";
 
-export const USAGE_URL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1";
+// Without skip_spend=1 the answer carries extra_usage, the usage credits.
+export const USAGE_URL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1";
+/** The prepaid usage-credit balance of an organization, as Claude Code's /usage-credits reads it. */
+export const PREPAID_URL = "https://api.anthropic.com/api/oauth/organizations/{org}/prepaid/credits";
 /** The Claude Code version to claim when `claude --version` cannot be read. */
 export const CLAUDE_CLI_FALLBACK = "2.1.304";
 
@@ -165,6 +178,121 @@ export function claudeBanked(data: unknown): { banked: Banked | null; note: stri
   return { banked: { count: credits.length, credits }, note: null };
 }
 
+/** What the usage response's extra_usage block says, in minor units of `currency`. */
+interface ExtraUsage {
+  readonly enabled: boolean;
+  /** The spend limit for the period; null when there is none. */
+  readonly cap: number | null;
+  readonly used: number;
+  readonly currency: string;
+  readonly places: number;
+}
+
+/** A JSON number as a number (a whole float such as 100.0 included); null for anything else. */
+function amountOf(value: unknown): number | null {
+  return typeof value === "boolean" ? null : numericValue(value);
+}
+
+/** Why extra usage is off when what is off is the credits: none left, or the limit reached. */
+const SPENT_REASONS = new Set(["org_level_disabled_until", "org_spend_cap_reached", "out_of_credits"]);
+
+/**
+ * The extra usage (usage credits) from the usage response; null when the plan has none to draw
+ * on. Turned off because the credits ran out or the spend limit was reached, it is there with
+ * nothing left; turned off otherwise, it is not there.
+ */
+export function claudeExtraUsage(data: unknown): ExtraUsage | null {
+  const block = get(data, "extra_usage");
+  if (!isRecord(block)) {
+    return null;
+  }
+  const enabled = get(block, "is_enabled") === true;
+  if (!enabled && !SPENT_REASONS.has(String(get(block, "disabled_reason")))) {
+    return null;
+  }
+  const used = amountOf(get(block, "used_credits"));
+  const limit = get(block, "monthly_limit"); // null: no spend limit
+  const cap = limit === null ? null : amountOf(limit);
+  const currency = get(block, "currency");
+  const places = get(block, "decimal_places");
+  if (used === null || (cap === null && limit !== null) || typeof currency !== "string") {
+    return null;
+  }
+  return {
+    enabled,
+    cap,
+    used,
+    currency: currency.toUpperCase(),
+    places: isPythonInt(places) && Number(places) >= 0 && Number(places) <= 4 ? Number(places) : 2,
+  };
+}
+
+/** The organization the login belongs to, as Claude Code finds it without asking the server. */
+function claudeOrganization(host: Host): string | null {
+  const fromEnv = host.env.CLAUDE_CODE_ORGANIZATION_UUID;
+  let org: unknown = fromEnv;
+  if (!fromEnv) {
+    try {
+      const config = join(host.env.CLAUDE_CONFIG_DIR || homeDirectory(host.env), ".claude.json");
+      org = get(get(JSON.parse(readFileSync(config, "utf8")), "oauthAccount"), "organizationUuid");
+    } catch {
+      return null;
+    }
+  }
+  // it goes into a URL path
+  return typeof org === "string" && /^[0-9a-f-]{8,64}$/i.test(org) ? org : null;
+}
+
+/** The prepaid balance in minor units of `currency` (null with auto-reload on); undefined when it cannot be read. */
+async function prepaidBalance(
+  headers: Record<string, string>,
+  currency: string,
+  host: Host,
+): Promise<number | null | undefined> {
+  const org = claudeOrganization(host);
+  if (org === null) {
+    return undefined;
+  }
+  try {
+    const response = await host.fetch(PREPAID_URL.replace("{org}", org), {
+      headers,
+      signal: AbortSignal.timeout(5_000), // inside the reading's lock: Claude Code waits as long
+    });
+    if (response.status !== 200) {
+      return undefined;
+    }
+    const data = parseJson(await response.text());
+    const amount = amountOf(get(data, "amount"));
+    const unit = get(data, "currency");
+    if (amount === null || typeof unit !== "string" || unit.toUpperCase() !== currency) {
+      return undefined;
+    }
+    const reload = get(data, "auto_reload_settings");
+    return isRecord(reload) && get(reload, "enabled") === true ? null : amount;
+  } catch {
+    return undefined; // the windows are read; the credits are unknown
+  }
+}
+
+/**
+ * The usage credits from the extra usage and the prepaid balance: what is left is the room under
+ * the spend limit or the balance, whichever is less (Claude Code's own sum), and nothing caps
+ * it with no spend limit and auto-reload on. Null when the balance cannot be read.
+ */
+export function claudeCredits(extra: ExtraUsage, balance: number | null | undefined): UsageCredits | null {
+  const scale = 10 ** extra.places;
+  const out = { spent: extra.used / scale, unit: extra.currency, places: extra.places };
+  if (!extra.enabled) {
+    return { left: 0, ...out };
+  }
+  if (balance === undefined) {
+    return null;
+  }
+  const room = extra.cap === null ? Infinity : extra.cap - extra.used;
+  const left = Math.min(room, balance === null ? Infinity : balance);
+  return { left: Number.isFinite(left) ? Math.max(0, left) / scale : null, ...out };
+}
+
 /** Why fetch failed, as urllib's URLError reason said it where the failure is the same. */
 function fetchFailure(error: unknown, host: Host): string {
   const code = error instanceof Error ? (error as { code?: unknown }).code : undefined;
@@ -179,7 +307,10 @@ function fetchFailure(error: unknown, host: Host): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function usageResponse(state: string, host: Host): Promise<unknown> {
+async function usageResponse(
+  state: string,
+  host: Host,
+): Promise<{ data: unknown; headers: Record<string, string> }> {
   // One call gives the windows and the banked resets. The server only evaluates reset
   // eligibility for the Claude Code surface, so this identifies as the installed Claude Code
   // (undocumented, may change).
@@ -218,11 +349,11 @@ async function usageResponse(state: string, host: Host): Promise<unknown> {
           : String(error),
     );
   }
-  return parseJson(body);
+  return { data: parseJson(body), headers };
 }
 
 export async function claudeReading(state: string, host: Host): Promise<Reading> {
-  const data = await usageResponse(state, host);
+  const { data, headers } = await usageResponse(state, host);
   const now = host.now();
   const windows: UsageWindow[] = [];
   for (const { key, name, lengthS } of CLAUDE_WINDOWS) {
@@ -248,5 +379,9 @@ export async function claudeReading(state: string, host: Host): Promise<Reading>
     throw new ExitError("agent-pace: no usage windows for this Claude login (subscription logins only)");
   }
   const { banked, note } = claudeBanked(data);
-  return { windows, banked, note, via: "usage-api" };
+  const extra = claudeExtraUsage(data);
+  // the balance is a second call, made only when there is extra usage to draw on
+  const balance = extra?.enabled ? await prepaidBalance(headers, extra.currency, host) : undefined;
+  const credits = extra === null ? null : claudeCredits(extra, balance);
+  return { windows, banked, note, via: "usage-api", credits };
 }

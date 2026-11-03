@@ -14,16 +14,19 @@
   per-lane burn (its lane numbers and its `lane_basis`, `lane_rates` and `token_cost` fields),
   lane headroom over `--lane-hours` with a week paced by its running lanes (the lane numbers and
   wording, a week's rate, status and `lanes` rate basis, the `lane_hours`, `lanes.hours` and
-  `window_average_rate` fields, and the `--lane-hours` help and usage error) and
-  `tokens-<source>.json`, which the Python version did not have. Number formatting goes
-  through `src/python-format.ts` and JSON through `src/python-json.ts`; never use
-  `toFixed`, `String(number)` or `JSON.stringify` for output. A change to any of these is a
-  breaking change and needs its own release note.
+  `window_average_rate` fields, and the `--lane-hours` help and usage error), usage credits
+  once a window is at its limit (the "on usage credits" lane wording and routing, the
+  `lanes.pool` and `usage_credits` fields, `<source>-credits.csv` and the `credits` key in
+  `claude-banked.json`) and `tokens-<source>.json`, which the Python version did not have.
+  Number formatting goes through `src/python-format.ts` and JSON through `src/python-json.ts`;
+  never use `toFixed`, `String(number)` or `JSON.stringify` for output. A change to any of these
+  is a breaking change and needs its own release note.
 - Never run agent-pace against the real backends or the real state while developing: no
   `agent-pace claude` without `--state` pointing at a scratch directory and a dummy
   `CLAUDE_CODE_OAUTH_TOKEN`, and no real `codex` on `PATH`. A run without `--state` appends to
   the user's history and calls the live usage endpoint with their login.
-- agent-pace only reads. It never redeems or claims a reset, and the Codex exchange stays
+- agent-pace only reads. It never redeems or claims a reset or buys credits, its Claude calls
+  stay `GET`s of the usage endpoint and the prepaid balance, and the Codex exchange stays
   `initialize`, `initialized`, `account/rateLimits/read`.
 
 ## Runtime / Commands
@@ -41,14 +44,15 @@ bun bin/agent-pace.ts --help
   through, so each name has its own file; a compiled binary reads the name from `argv0`.
 - `src/cli.ts` runs a command: arguments, the watch loop, alerts and exit statuses.
 - `src/arguments.ts` and `src/help-format.ts` reproduce argparse's parsing, help and errors.
-- `src/claude.ts` and `src/codex.ts` read the two sources; `src/readings.ts` shares a Claude
-  reading per machine (lock, one-minute cache, sidecar) and records history; `src/lanes.ts`
-  counts active lanes; `src/history.ts` owns the CSV files.
+- `src/claude.ts` and `src/codex.ts` read the two sources, their usage credits included;
+  `src/readings.ts` shares a Claude reading per machine (lock, one-minute cache, sidecar) and
+  records history; `src/lanes.ts` counts active lanes; `src/history.ts` owns the CSV files.
 - `src/token-ledger.ts` reads what each lane spent from the session files into
   `tokens-<source>.json`; `src/token-prices.ts` prices tokens; `src/token-burn.ts` learns
   points per dollar and gives each lane's burn.
 - `src/assess.ts` turns windows and history into targets, banked-reset advice and lane
-  headroom; `src/report.ts` words it as text and JSON; `src/plan.ts` is `agent-pace plan`.
+  headroom, on the plan or, once a window is at its limit, on the usage credits;
+  `src/report.ts` words it as text and JSON; `src/plan.ts` is `agent-pace plan`.
 - `src/host.ts` is everything taken from the machine (clock, env, fetch, output). Tests pass
   their own host instead of patching globals.
 

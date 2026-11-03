@@ -9,6 +9,9 @@ import type { Source, UsageWindow } from "./usage.ts";
 /** A history row: [observed at, used, resets at]. */
 export type HistoryRow = readonly [number, number, number];
 
+/** The history of what a source's usage credits have spent: `<source>-credits.csv`. */
+export const CREDITS_LOG = "credits";
+
 /** Reset times drift between readings; two within this many seconds are the same window. */
 export const RESET_JITTER_S = 300;
 

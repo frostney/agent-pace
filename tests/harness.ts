@@ -153,6 +153,8 @@ export class Case {
   claudeError: Error | null = null;
   /** Replaces the usage endpoint's answer, for its error statuses. */
   claudeResponse: (() => Response) | null = null;
+  /** The prepaid usage-credit balance the organization endpoint answers; null answers 404. */
+  prepaid: Fields | null = null;
   /** The exit status of the last run. */
   status = 0;
   /** Each sleep the watch loop asks for, in seconds; ends the loop after `sleeps` of them. */
@@ -215,6 +217,11 @@ export class Case {
         this.requests.push({ url, headers: new Headers(init.headers) });
         if (this.claudeError) {
           throw this.claudeError;
+        }
+        if (url.includes("/prepaid/credits")) {
+          return this.prepaid === null
+            ? new Response("{}", { status: 404 })
+            : new Response(JSON.stringify(this.prepaid));
         }
         return this.claudeResponse ? this.claudeResponse() : new Response(JSON.stringify(this.claude));
       },

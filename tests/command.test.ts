@@ -168,6 +168,13 @@ describe("PacingConstants", () => {
     );
     c.claudeLanes(1);
     const data = await c.json("claude");
-    expect(data.lanes).toEqual({ active: 1, headroom: 7, per_lane_rate: 10, window: "5h", hours: 1 });
+    expect(data.lanes).toEqual({
+      active: 1,
+      headroom: 7,
+      per_lane_rate: 10,
+      window: "5h",
+      hours: 1,
+      pool: "plan",
+    });
   });
 });
