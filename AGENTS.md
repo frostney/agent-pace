@@ -17,8 +17,9 @@
   `window_average_rate` fields, and the `--lane-hours` help and usage error), usage credits
   once a window is at its limit (the "on usage credits" lane wording and routing, the
   `lanes.pool` and `usage_credits` fields, `<source>-credits.csv` and the `credits` key in
-  `claude-banked.json`) and `tokens-<source>.json`, which the Python version did not have.
-  Number formatting goes through `src/python-format.ts` and JSON through `src/python-json.ts`;
+  `claude-banked.json`), the default `--target` of 100 where the Python version had 97 (the
+  aim and every number and status it sets) and `tokens-<source>.json`, which the Python version
+  did not have. Number formatting goes through `src/python-format.ts` and JSON through `src/python-json.ts`;
   never use `toFixed`, `String(number)` or `JSON.stringify` for output. A change to any of these
   is a breaking change and needs its own release note.
 - Never run agent-pace against the real backends or the real state while developing: no
@@ -60,7 +61,9 @@ bun bin/agent-pace.ts --help
 
 - `tests/agent-pace.test.ts` is the parity suite: the Python version's tests, one for one,
   against the same recorded responses, with a fake `codex` and `claude` on `PATH`, a fixed
-  clock and a fake usage endpoint. Keep it one for one; add new tests beside it.
+  clock and a fake usage endpoint. Keep it one for one; add new tests beside it. The harness
+  passes `--target 97`, the Python version's default, unless a test gives its own `--target` or
+  sets `defaultTarget`.
 - Tests never touch the network, the real `~/.claude`, `~/.codex` or state directory.
 - `tests/command.test.ts` covers what the Python suite did not (exit statuses, the usage
   endpoint's error answers, help, `--watch`, `--notify`, a pacing constant); its expectations

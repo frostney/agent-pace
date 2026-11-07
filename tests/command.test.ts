@@ -153,6 +153,14 @@ describe("Watch", () => {
 });
 
 describe("PacingConstants", () => {
+  // The Python version aimed at 97%; a window is now used up, so nothing is left at its reset.
+  test("the default target is 100", async () => {
+    c.defaultTarget = true;
+    const data = await c.json("claude");
+    expect((data.windows as Fields[]).map((w) => w.target)).toEqual([100, 100]);
+    expect(await c.claudeOut()).toContain("lands on 100.0%");
+  });
+
   // The Python suite let FAR_BELOW move without a failure. A week at 25% with three days gone
   // and four left ends near 92% at twice its average burn, so it does not hold the source at
   // "measuring"; at three times it would.
