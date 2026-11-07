@@ -155,6 +155,8 @@ export class Case {
   claudeResponse: (() => Response) | null = null;
   /** The prepaid usage-credit balance the organization endpoint answers; null answers 404. */
   prepaid: Fields | null = null;
+  /** Runs without `--target 97`, so a test sees the current default. */
+  defaultTarget = false;
   /** The exit status of the last run. */
   status = 0;
   /** Each sleep the watch loop asks for, in seconds; ends the loop after `sleeps` of them. */
@@ -376,7 +378,11 @@ export class Case {
   async runAs(prog: string, ...argv: string[]): Promise<[string, string]> {
     this.out = "";
     this.err = "";
-    const args = argv.includes("--state") ? argv : [...argv, "--state", this.state];
+    const withState = argv.includes("--state") ? argv : [...argv, "--state", this.state];
+    // the recorded expectations aim at the Python version's default of 97; `defaultTarget` runs
+    // with the current default instead
+    const args =
+      this.defaultTarget || argv.includes("--target") ? withState : [...withState, "--target", "97"];
     try {
       this.status = await main(args, prog, this.host());
     } catch (error) {
