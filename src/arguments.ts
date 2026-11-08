@@ -196,7 +196,7 @@ export class ArgumentParser {
       alertsOnly: false,
       json: false,
       target: 100,
-      band: 7,
+      band: 3,
       interval: 300,
       plan: "fill",
       reserve: 10,
