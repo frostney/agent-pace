@@ -9,7 +9,7 @@ left of them. It only advises: it never redeems a reset or buys credits.
 ```console
 $ agent-pace plan
 route spare work to Codex: banked reset expires in 36h and cannot be filled by then (needs 2.4%/h, peak 0.7%/h); fill what you can, then redeem it (lanes: Codex room for ~264 more lanes at 0.3%/h each for 1.0h; Claude measuring: start at most 1-2 new lanes)
-  12:25 claude: 5h 6% ? 1.17h left (80.6%/h lands on 100.0%) -> measuring | 7d 40% 0.6%/h (window avg) 96.0h left, ends ~93% (0.6%/h lands on 100.0%) -> keep going (measuring: start at most 1-2 new lanes)
+  12:25 claude: 5h 6% ? 1.17h left (80.6%/h lands on 100.0%) -> measuring | 7d 40% 0.6%/h (window avg) 96.0h left, ends ~93% (0.6%/h lands on 100.0%) -> room left: add work (measuring: start at most 1-2 new lanes)
   12:25 codex: 7d 20% 0.7%/h (window avg) 139.81h left, runs out in ~4.8d (2.4%/h lands on 100%) -> room left: add work (room for ~264 more lanes at 0.3%/h each for 1.0h)
     banked reset expires Fri 24 Oct 00:10 (in 35.8h): cannot reach 100% by then (needs 2.4%/h, peak seen 0.7%/h); redeem it anyway by Thu 23 Oct 22:10, an unused reset is lost [3 banked]
 ```
@@ -20,7 +20,7 @@ Each [release](https://github.com/frostney/agent-pace/releases) has a standalone
 macOS and Linux (arm64 and x64), with `claude-pace` and `codex-pace` links beside it:
 
 ```sh
-version=4.0.0 target=darwin-arm64   # or darwin-x64, linux-x64, linux-arm64
+version=5.0.0 target=darwin-arm64   # or darwin-x64, linux-x64, linux-arm64
 curl -fsSL "https://github.com/frostney/agent-pace/releases/download/v$version/agent-pace-$version-$target.tar.gz" \
   | tar -xz -C ~/.local/bin --strip-components=1 \
       "agent-pace-$version-$target/agent-pace" \
@@ -248,7 +248,7 @@ more lanes each provider supports. It changes nothing.
 | Option                               | Default                     | Meaning                                                                                                                                                                        |
 | ------------------------------------ | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `--target`                           | 100                         | the usage to aim for at each reset, in percent                                                                                                                                 |
-| `--band`                             | 7                           | alert below `--target` minus this many points                                                                                                                                  |
+| `--band`                             | 3                           | alert below `--target` minus this many points                                                                                                                                  |
 | `--interval`                         | 300                         | seconds between readings with `--watch`                                                                                                                                        |
 | `--plan fill\|even`                  | fill                        | how the short window is paced against the long one                                                                                                                             |
 | `--reserve`                          | 10                          | with `--plan fill`, pace like `--plan even` once the long window has this many points left                                                                                     |

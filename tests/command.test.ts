@@ -155,10 +155,24 @@ describe("Watch", () => {
 describe("PacingConstants", () => {
   // The Python version aimed at 97%; a window is now used up, so nothing is left at its reset.
   test("the default target is 100", async () => {
-    c.defaultTarget = true;
+    c.currentDefaults = true;
     const data = await c.json("claude");
     expect((data.windows as Fields[]).map((w) => w.target)).toEqual([100, 100]);
     expect(await c.claudeOut()).toContain("lands on 100.0%");
+  });
+
+  // The Python version's band of 7 let a window end at 93% unremarked; now room left is
+  // reported once the projection falls more than 3 points short of the target.
+  test("the default band is 3", async () => {
+    const r5 = Math.trunc(NOW + 3.5 * 3600);
+    (c.claude.five_hour as Fields).utilization = 60;
+    (c.claude.five_hour as Fields).resets_at = iso(r5);
+    (c.claude.seven_day as Fields).utilization = 40;
+    c.history("claude", "5h", [[NOW - 3600, 50]], r5); // 10%/h for 3.5h ends near 95%
+    c.currentDefaults = true;
+    const five = (data: Fields) => (data.windows as Fields[])[0] as Fields;
+    expect(five(await c.json("claude", "--state", c.copyState())).status).toBe("under");
+    expect(five(await c.json("claude", "--band", "7", "--state", c.copyState())).status).toBe("on-target");
   });
 
   // The Python suite let FAR_BELOW move without a failure. A week at 25% with three days gone
