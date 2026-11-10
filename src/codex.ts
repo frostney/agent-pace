@@ -433,3 +433,67 @@ export async function codexReading(
   }
   return { ...codexWindows(host), banked: null, via: "session-logs" };
 }
+
+/** ChatGPT's usage endpoint, which `codex app-server` reads its rate limits from. */
+export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+/** The banked rate-limit resets on a ChatGPT account, with their expiries. */
+export const CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+
+/**
+ * The windows and plan in a wham/usage answer (the rate_limit block's primary and secondary
+ * windows), and how many banked resets it says are available (null when it does not say).
+ */
+export function codexUsageWindows(
+  data: unknown,
+  observed: number,
+  now: number,
+): { windows: UsageWindow[]; plan: string | null; available: number | null } {
+  const limit = get(data, "rate_limit");
+  const windows: UsageWindow[] = [];
+  for (const slot of ["secondary_window", "primary_window"]) {
+    const w = isRecord(limit) ? get(limit, slot) : null;
+    if (!isRecord(w) || get(w, "used_percent") === null) {
+      continue;
+    }
+    const lengthS = toInt(or(get(w, "limit_window_seconds"), () => 0));
+    let resets: number;
+    if (truthy(get(w, "reset_at"))) {
+      resets = toFloat(get(w, "reset_at"));
+    } else if (get(w, "reset_after_seconds") !== null) {
+      resets = observed + toFloat(get(w, "reset_after_seconds"));
+    } else {
+      continue;
+    }
+    windows.push(codexWindow(toFloat(get(w, "used_percent")), lengthS, resets, observed, now));
+  }
+  const plan = get(data, "plan_type");
+  const summary = get(data, "rate_limit_reset_credits");
+  const available = isRecord(summary) ? get(summary, "available_count") : null;
+  return {
+    windows: windows.sort((a, b) => a.lengthS - b.lengthS),
+    plan: typeof plan === "string" && plan ? plan : null,
+    available: isPythonInt(available) ? Number(available) : null,
+  };
+}
+
+/** The banked resets in a wham/rate-limit-reset-credits answer: available Codex resets with their expiries. */
+export function codexResetCredits(data: unknown): Banked {
+  const listed = get(data, "credits");
+  if (!Array.isArray(listed)) {
+    throw new TypeError("credits is not a list");
+  }
+  const credits: Credit[] = [];
+  for (const c of listed) {
+    if (!isRecord(c) || get(c, "status") !== "available" || get(c, "reset_type") !== "codex_rate_limits") {
+      continue;
+    }
+    const expires = get(c, "expires_at");
+    credits.push({
+      expiresAt: typeof expires === "string" && expires ? parseIso(expires.replaceAll("Z", "+00:00")) : null,
+      // decoded from JSON, so it is JSON
+      title: (get(c, "title") ?? null) as Json,
+      clears: null, // a Codex reset clears every window
+    });
+  }
+  return { count: credits.length, credits };
+}

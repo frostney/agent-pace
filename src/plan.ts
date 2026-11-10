@@ -1,21 +1,16 @@
-import {
-  assess,
-  creditsOf,
-  laneSupply,
-  type PaceOptions,
-  tooLateToFill,
-  type WindowAssessment,
-} from "./assess.ts";
+import { creditsOf, laneSupply, type PaceOptions, tooLateToFill, type WindowAssessment } from "./assess.ts";
 import { ExitError, RateLimited, survivableErrorText } from "./errors.ts";
 import type { Host } from "./host.ts";
 import { formatFixed } from "./python-format.ts";
 import { dumps, type JsonObject } from "./python-json.ts";
-import { readSource } from "./readings.ts";
+import { assessReading, readSource } from "./readings.ts";
 import {
+  accountLines,
   creditPool,
   lanePhrase,
   noteLines,
   perHour,
+  readingName,
   redeemIt,
   render,
   sourceJson,
@@ -219,16 +214,7 @@ export async function runPlan(options: PaceOptions & { readonly json: boolean },
   for (const source of SOURCES) {
     try {
       const reading = await readSource(source, options.state, host);
-      const res = assess(
-        source,
-        reading.windows,
-        options,
-        reading.banked,
-        reading.lanes,
-        host.now(),
-        reading.tokens,
-        reading.credits,
-      );
+      const res = assessReading(source, reading, options, host.now());
       read.push({ source, reading, res });
     } catch (error) {
       errors[source] = readError(error);
@@ -259,15 +245,18 @@ export async function runPlan(options: PaceOptions & { readonly json: boolean },
       errors: Object.fromEntries(failed.map((s) => [s, errors[s] ?? ""])),
     };
     for (const { source, reading, res } of read) {
-      out[source] = sourceJson(reading, res);
+      out[source] = sourceJson(reading, res, host.now());
     }
     host.stdout(`${dumps(out)}\n`);
     return;
   }
   const lines = [text];
   for (const { source, reading, res } of read) {
-    lines.push(`  ${render(source, res, host.now(), host.timeZone)}`);
+    lines.push(`  ${render(source, res, host.now(), host.timeZone, readingName(source, reading))}`);
     for (const line of noteLines(source, res, reading, words)) {
+      lines.push(`    ${line}`);
+    }
+    for (const line of reading.pool ? accountLines(reading.pool, host.now(), words) : []) {
       lines.push(`    ${line}`);
     }
   }

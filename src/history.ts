@@ -1,7 +1,7 @@
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { floatRepr, parseFloatText } from "./python-format.ts";
-import type { Source, UsageWindow } from "./usage.ts";
+import type { HistoryKey, UsageWindow } from "./usage.ts";
 
 // The history files are CSV as Python's csv module wrote them ("\r\n" line ends, floats in
 // repr), so the history a Python version kept carries over.
@@ -15,7 +15,7 @@ export const CREDITS_LOG = "credits";
 /** Reset times drift between readings; two within this many seconds are the same window. */
 export const RESET_JITTER_S = 300;
 
-export function logPath(state: string, source: Source, name: string): string {
+export function logPath(state: string, source: HistoryKey, name: string): string {
   return join(state, `${source}-${name}.csv`);
 }
 
@@ -95,7 +95,7 @@ export function csvLine(fields: readonly (string | number)[]): string {
   return `${fields.join(",")}\r\n`;
 }
 
-export function record(state: string, source: Source, w: UsageWindow, minGap = 0): void {
+export function record(state: string, source: HistoryKey, w: UsageWindow, minGap = 0): void {
   const path = logPath(state, source, w.name);
   mkdirSync(state, { recursive: true });
   const last = read(path).at(-1);

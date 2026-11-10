@@ -294,7 +294,7 @@ export function claudeCredits(extra: ExtraUsage, balance: number | null | undefi
 }
 
 /** Why fetch failed, as urllib's URLError reason said it where the failure is the same. */
-function fetchFailure(error: unknown, host: Host): string {
+export function fetchFailure(error: unknown, host: Host): string {
   const code = error instanceof Error ? (error as { code?: unknown }).code : undefined;
   if (code === "ConnectionRefused") {
     return `[Errno ${constants.errno.ECONNREFUSED}] Connection refused`;
@@ -311,15 +311,8 @@ async function usageResponse(
   state: string,
   host: Host,
 ): Promise<{ data: unknown; headers: Record<string, string> }> {
-  // One call gives the windows and the banked resets. The server only evaluates reset
-  // eligibility for the Claude Code surface, so this identifies as the installed Claude Code
-  // (undocumented, may change).
-  const headers = {
-    Authorization: `Bearer ${claudeToken(host)}`,
-    "anthropic-beta": "oauth-2025-04-20",
-    "User-Agent": `claude-cli/${claudeCliVersion(state, host)} (external, cli)`,
-    "x-app": "cli",
-  };
+  // One call gives the windows and the banked resets.
+  const headers = claudeUsageHeaders(`Bearer ${claudeToken(host)}`, claudeCliVersion(state, host));
   const signal = AbortSignal.timeout(20_000);
   let response: Response;
   try {
@@ -352,9 +345,21 @@ async function usageResponse(
   return { data: parseJson(body), headers };
 }
 
-export async function claudeReading(state: string, host: Host): Promise<Reading> {
-  const { data, headers } = await usageResponse(state, host);
-  const now = host.now();
+/**
+ * The headers the usage endpoint is read with: it only evaluates reset eligibility for the
+ * Claude Code surface, so they identify as the installed Claude Code (undocumented, may change).
+ */
+export function claudeUsageHeaders(authorization: string, cliVersion: string): Record<string, string> {
+  return {
+    Authorization: authorization,
+    "anthropic-beta": "oauth-2025-04-20",
+    "User-Agent": `claude-cli/${cliVersion} (external, cli)`,
+    "x-app": "cli",
+  };
+}
+
+/** The windows in a usage response; a window that has not started (no resets_at) is left out. */
+export function claudeWindows(data: unknown, now: number): UsageWindow[] {
   const windows: UsageWindow[] = [];
   for (const { key, name, lengthS } of CLAUDE_WINDOWS) {
     const w = get(data, key);
@@ -375,6 +380,12 @@ export async function claudeReading(state: string, host: Host): Promise<Reading>
       });
     }
   }
+  return windows;
+}
+
+export async function claudeReading(state: string, host: Host): Promise<Reading> {
+  const { data, headers } = await usageResponse(state, host);
+  const windows = claudeWindows(data, host.now());
   if (windows.length === 0) {
     throw new ExitError("agent-pace: no usage windows for this Claude login (subscription logins only)");
   }

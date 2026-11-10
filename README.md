@@ -20,7 +20,7 @@ Each [release](https://github.com/frostney/agent-pace/releases) has a standalone
 macOS and Linux (arm64 and x64), with `claude-pace` and `codex-pace` links beside it:
 
 ```sh
-version=5.0.0 target=darwin-arm64   # or darwin-x64, linux-x64, linux-arm64
+version=5.1.0 target=darwin-arm64   # or darwin-x64, linux-x64, linux-arm64
 curl -fsSL "https://github.com/frostney/agent-pace/releases/download/v$version/agent-pace-$version-$target.tar.gz" \
   | tar -xz -C ~/.local/bin --strip-components=1 \
       "agent-pace-$version-$target/agent-pace" \
@@ -59,6 +59,9 @@ takes it from any link or copy with that name; run from source, only the `claude
   (`account/rateLimits/read`, read only). If the app server is not available, the windows and
   credits come from the rate-limit snapshots Codex writes into its own session logs (as fresh
   as your last Codex turn) and the banked resets are reported as unknown.
+- **Through a hub:** on a machine whose Claude Code or Codex goes through a
+  [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) auth hub, the accounts on the
+  hub, pooled (see [Through a CLIProxyAPI hub](#through-a-cliproxyapi-hub)).
 
 ### What it reports
 
@@ -264,10 +267,158 @@ agent-pace keeps its history in `~/.local/state/agent-pace/`: one CSV per source
 (`claude-5h.csv`, `codex-7d.csv`: observed at, used, resets at), the lane counts
 (`lanes-<source>.csv`), what the usage credits have spent (`<source>-credits.csv`), the Claude
 banked resets and credits from the last reading (`claude-banked.json`), and what each lane spent per minute over the last eight days with how far
-each session file has been read (`tokens-<source>.json`). The first reading reads the last
+each session file has been read (`tokens-<source>.json`). On a hub client the pool's readings
+go into their own files (`claude-pool-5h.csv`, `codex-pool-7d.csv`), with the pool's accounts
+and shares at the last reading (`claude-pool-members`) and the address that last answered as a
+hub (`claude-pool-hub`). The first reading reads the last
 eight days of session files, a few seconds for a busy week; later readings read only what was
 appended. Claude readings are shared per machine through a lock and a one-minute
 cache, so run one watcher rather than one per agent.
+
+## Through a CLIProxyAPI hub
+
+A CLIProxyAPI hub holds several Claude and Codex logins and routes each request to one of
+them. A machine that sends its Claude Code or Codex to the hub has no login of its own to read
+(any login left on it is not the one being used), so agent-pace reads the hub's accounts
+instead and paces their pool:
+
+```console
+$ agent-pace claude
+12:25 claude pool (2 of 3 accounts): 5h 55% 12.0%/h 1.75h left, ends ~76% (25.7%/h lands on 100.0%) -> no lane headroom: start nothing new | 7d 65% 0.8%/h (window avg) 84.0h left, runs out in ~43.8h (0.4%/h lands on 100.0%) -> slow down
+  work (weight 3): 5h 40% resets Wed 22 Oct 14:25 (in 2.0h) | 7d 60% resets Sat 25 Oct 12:25 (in 72.0h); 1 banked, next expires Fri 24 Oct 12:25
+  claude 2: 5h 100% resets Wed 22 Oct 13:25 (in 1.0h) | 7d 80% resets Mon 27 Oct 11:25 (in 120.0h); cooling down on the hub
+  claude 3: disabled on the hub, not in the pool
+  claude 4: unreadable (HTTP 401), left out of the pool
+```
+
+The first line is the pool, worded as a single account's line is, and its verdict (`room
+left: add work`, `keep going`, `slow down`) answers for the pool. Below it is one line per
+account on the hub: its windows, their resets and its banked resets, or why it is left out.
+
+### Which machines read the hub
+
+- **claude:** `$CLAUDE_CONFIG_DIR/settings.json` (default `~/.claude/settings.json`) sets both
+  `env.ANTHROPIC_BASE_URL` and `env.ANTHROPIC_AUTH_TOKEN`, as a hub client is usually set up.
+- **codex:** `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) sets
+  `model_provider = "cliproxy"`, and its `[model_providers.cliproxy]` table has `base_url`
+  (the hub's address and `/v1`) and the key, as `experimental_bearer_token` or in the
+  environment variable `env_key` names.
+
+agent-pace then asks that address, at `<hub>/agent-pace/v1/usage/<claude|codex>`, with that
+same access key: a client needs no other secret. Only an https address (or plain http to this
+machine itself) is asked. It is a hub when the answer carries the `X-Agent-Pace-Hub` header
+that `agent-pace hub serve` puts on every answer; then the pool is read and the machine's own
+login never is, and the address is remembered as a hub (`<source>-pool-hub`). Until an address
+has answered so, any other answer or none (a gateway that is no hub, a hub without the service,
+a local router that is not running) leaves agent-pace reading this machine as before, as does a
+plain-http address elsewhere or a config without a key. Once it has, an answer without the
+header or none is a failed reading, as an unreachable usage endpoint is: a hub whose service is
+down is still the hub, and this machine's own login is not the one in use. On the hub machine
+itself, Claude Code and Codex point at CLIProxyAPI's own port, which is no agent-pace service, so
+agent-pace there reads that machine as before.
+
+### The pool
+
+Each account counts with a **capacity**: the `weight` its credential has on the hub
+(CLIProxyAPI's per-credential integer, set in the account's auth file or the management panel),
+1 when it has none. Plans are not turned into sizes: the providers do not publish how many
+times one plan's window holds another's, so give a bigger account a bigger weight (for example
+4 for a plan four times the size). `--json` shows each account's plan where the provider names
+it (Codex) and its weight.
+
+For each window (5h and 7d for Claude, the windows Codex reports), over the accounts in the
+pool, with `c` an account's capacity, `u` its use of its own window in percent and `t` the
+time that window resets:
+- **use** = Σ c·u / Σ c. An account without that window running (no Claude session in the last
+  five hours) counts as 0%.
+- **reset** = Σ c·t / Σ c over the accounts with that window running; now plus the window's
+  length if none has it running. The hours left are to that time.
+
+If every account in the pool has the window running and burns the same share of its own
+capacity each hour, account `i` ends its window at `u_i + r·h_i`, and the capacity-weighted
+mean of those ends is exactly `use + r·hours left`. With an account whose window is not
+running, the mean reset leaves it out, so this is an approximation until its window starts.
+So the pool's projection is the mean of where the accounts' windows end, the target
+(`lands on 100%`) asks that they end full on average, and `runs out` / `slow down` says that on
+average they reach their limit before they reset. It is a mean: one account can reach its
+limit while the pool has room (the hub then routes around it, and its line says `cooling down
+on the hub`).
+- **In the pool:** the accounts the hub has enabled whose usage was read, with a capacity above
+  0. A disabled account is not counted at all. An unreadable one is left out of both means, and
+  the line says so ("2 of 3 accounts"); the room it has is then missing from the verdict. An
+  account with weight 0 is left out. An account the hub is cooling down counts with the use it
+  reports. An account whose read fails counts with its last good reading for up to half an
+  hour (without the windows that have reset since), and its line says when that was read
+  ("as read Wed 22 Oct 12:20 (now HTTP 429)"). With no account readable, the reading fails as
+  an unreachable endpoint does.
+- **Rate:** the pool keeps its own history (`claude-pool-5h.csv` and so on) and its rate is
+  measured from it as a single window's is, held to the same evidence. When an account resets,
+  the pool's use drops and its reset time moves: that starts a new stretch, so the rate is
+  measured again from there. It is no end of the pool's window, so a pool never says "window
+  reset", and `previous_window_ended_at` is null. When an account joins or leaves the pool, or
+  its weight changes, or an account starts or stops standing in with an older reading, the
+  pool's use moves by more than anything burned: the pool's history starts over then (the accounts and shares of the last reading are kept in
+  `<source>-pool-members`), and the rate is measured afresh.
+- **Banked resets** are listed on each account's line and in `--json`, and do not change the
+  pool's pacing: a reset refills one account, a share of the pool, and is redeemed for that
+  account. The pool's own `banked_resets` is unknown (`known: false`, `via: "hub"`).
+- **Usage credits** are not read through the hub.
+- **Lanes** are counted on this machine, as without a hub. Other machines' lanes draw on the
+  same pool: their use shows in the pool's rate but not in the lane count, so the per-lane burn
+  (shared out, or the points per dollar learned from this machine's spending) comes out higher
+  than a lane costs, and the headroom lower. Each machine paces its own lanes against what is
+  left of the whole pool.
+
+`--json` adds `hub` to the source: the hub's `url`, `observed_at`, `accounts_in_pool`,
+`accounts_enabled`, `pool_capacity` (Σ c), and `accounts`, each with `label`, `plan`, `weight`
+(null when unset), `capacity`, `in_pool`, `state` (`ok`, `disabled` or `unreadable`), `detail`
+(why it is unreadable, or why its reading is an older one), `read_at` (when its windows were
+read), `cooling_down`, `windows` (`window`, `used`, `resets_at`,
+`hours_left`) and `banked_resets` (`known`, `count`, `credits`). The pool's `windows` are the
+usual window objects.
+
+### On the hub: `agent-pace hub serve`
+
+```sh
+agent-pace hub serve        # on the hub, beside CLIProxyAPI, as a service
+```
+
+It reads the accounts with CLIProxyAPI's management API: `GET /v0/management/auth-files` lists
+them, and `POST /v0/management/api-call` makes one request with an account's login (CLIProxyAPI
+puts the account's token where a header says `$TOKEN$`). Because that can send any account's
+token anywhere, the management key never leaves the hub: the service runs there, takes
+CLIProxyAPI only on this machine (`--cliproxy`, default `http://127.0.0.1:8317`) and listens on
+127.0.0.1 only (`--port`, default 8318), and the hub publishes it on its tailnet address
+under `/agent-pace`. Its options:
+
+| Option           | Default                     | Meaning                                                        |
+| ---------------- | --------------------------- | -------------------------------------------------------------- |
+| `--port`         | 8318                        | the port on 127.0.0.1 to listen on                             |
+| `--keys DIR`     | `~/.config/cliproxyapi`     | the directory with the `access-key` and `management-key` files |
+| `--cliproxy URL` | `http://127.0.0.1:8317`     | CLIProxyAPI, on this machine only                              |
+| `--state DIR`    | `~/.local/state/agent-pace` | where the Claude Code version it claims is remembered          |
+- **Requests:** `GET /v1/usage/claude` and `GET /v1/usage/codex` (the same under
+  `/agent-pace/`), with `Authorization: Bearer <access key>`, the key in `access-key`, compared
+  in constant time. Without it: 401. Anything else: 404, or 405 for another method.
+- **Upstream:** only GETs. For a Claude account, the usage endpoint Claude Code's `/usage`
+  reads (as above, with `?cedar_ember=1` for the banked resets). For a Codex account,
+  `https://chatgpt.com/backend-api/wham/usage`, the endpoint Codex reads its rate limits from,
+  and, when that says resets are banked, `.../wham/rate-limit-reset-credits` for their expiries.
+  It never redeems or claims a reset.
+- **Cache:** each provider's accounts are read at most once a minute, however many clients ask;
+  a failed read is not kept. An account whose usage endpoint answers 429 is not asked again
+  until its `Retry-After` has passed (10 minutes without one), and an account whose read fails
+  is answered with its last good reading for up to half an hour, its `detail` saying why and
+  `read_at` when it was read.
+- **Answer:** `{"version": 1, "provider", "observed_at", "accounts": [...]}`, each account with
+  `label`, `plan`, `weight`, `cooling_down`, `state`, `detail`, `read_at`, `windows` (`name`,
+  `used`, `resets_at`, `length_s`; times in unix seconds) and `banked` (`count`, `credits` with
+  `expires_at`, `title`, `clears`; null when unknown), with the header `X-Agent-Pace-Hub: 1`.
+  The `label` is the note the credential has on the hub (unless it looks like an email
+  address), else the provider and its place in the hub's list ("claude 2"), which moves when an
+  account is added: set a note for a lasting name. No token, email address or upstream body is
+  ever in it; `detail` is the upstream status ("HTTP 401") or what failed. A management API
+  that fails answers 502 with what failed; missing key files 503.
 
 ## Credentials and the endpoints it reads
 
@@ -298,11 +449,13 @@ always terminated); the fallback snapshots come from `$CODEX_HOME/sessions` (def
 
 agent-pace 1.4 was a Python script. This TypeScript version prints the same text and `--json`
 digit for digit, takes the same flags, and reads and writes the same state files, so a history
-the Python version kept carries over. Four things are new: the measured per-lane burn, which
+the Python version kept carries over. Five things are new: the measured per-lane burn, which
 changes the lane numbers once points per dollar are learned; lane headroom over
 `--lane-hours` with a week paced by its running lanes (2.0), which changes the lane numbers, a
 week's rate and status, and the lane wording; usage credits (3.0), which give a window at its
-limit lane headroom on the credits; and the `--json` fields and state files that describe them.
+limit lane headroom on the credits; reading a CLIProxyAPI hub's pool on a machine that goes
+through one, and `agent-pace hub serve` (5.1); and the `--json` fields and state files that
+describe them.
 Otherwise they differ only here:
 - Failures the operating system reports use urllib's and OSError's frames (`<urlopen error
   ...>`, `[Errno 2] No such file or directory: ...`); a refused connection and an unknown host

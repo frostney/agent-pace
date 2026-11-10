@@ -5,7 +5,7 @@ import { Float, formatFixed, roundTo, roundToInt } from "./python-format.ts";
 import { isoOrNull, isoUtc } from "./time-format.ts";
 import { fitTokenCost, laneRates, type TokenCost } from "./token-burn.ts";
 import type { TokenUse } from "./token-ledger.ts";
-import type { Banked, Credit, LaneReading, Source, UsageCredits, UsageWindow } from "./usage.ts";
+import type { Banked, Credit, HistoryKey, LaneReading, UsageCredits, UsageWindow } from "./usage.ts";
 
 export type PlanMode = "fill" | "even";
 
@@ -626,7 +626,7 @@ function creditPlan(
 }
 
 export function assess(
-  source: Source,
+  source: HistoryKey,
   windows: readonly UsageWindow[],
   options: PaceOptions,
   banked: Banked | null,

@@ -1,16 +1,20 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { CLAUDE_WINDOWS, claudeReading } from "./claude.ts";
+import { assess, type PaceOptions, type WindowAssessment } from "./assess.ts";
+import { CLAUDE_WINDOWS, claudeReading, fetchFailure } from "./claude.ts";
 import { codexReading } from "./codex.ts";
 import { withLock } from "./file-lock.ts";
 import { CREDITS_LOG, logPath, read, record } from "./history.ts";
 import type { Host } from "./host.ts";
+import { hubLogin, hubReading, poolMembers, poolWindows } from "./hub.ts";
 import { laneReading } from "./lanes.ts";
 import { dumps, float, isRecord, type Json } from "./python-json.ts";
 import { tokenReading } from "./token-ledger.ts";
 import type {
   Banked,
   Credit,
+  HistoryKey,
+  HubPool,
   Reading,
   ReadingWithLanes,
   Source,
@@ -210,6 +214,97 @@ async function readCodex(state: string, host: Host): Promise<ReadingWithLanes> {
   };
 }
 
-export function readSource(source: Source, state: string, host: Host): Promise<ReadingWithLanes> {
+/**
+ * Starts the pool's history over when its accounts or their shares changed since the last
+ * reading (`<source>-pool-members`): an account joining or leaving moves the pool's use by more
+ * than it burned, which the history would read as burn.
+ */
+function keepPoolMembers(state: string, source: Source, pool: HubPool): void {
+  const path = join(state, `${source}-pool-members`);
+  const members = poolMembers(pool);
+  let before: string | null = null;
+  try {
+    before = readFileSync(path, "utf8");
+  } catch {
+    before = null;
+  }
+  if (before === members) {
+    return;
+  }
+  mkdirSync(state, { recursive: true });
+  if (before !== null) {
+    for (const name of readdirSync(state)) {
+      if (name.startsWith(`${source}-pool-`) && name.endsWith(".csv")) {
+        rmSync(join(state, name), { force: true });
+      }
+    }
+  }
+  writeFileSync(path, members);
+}
+
+/**
+ * A hub client's reading: the pool of the hub's accounts, kept in its own history
+ * (`<source>-pool-<window>.csv`); the lanes are this machine's, as without a hub.
+ */
+async function readPool(source: Source, pool: HubPool, state: string, host: Host): Promise<ReadingWithLanes> {
+  const windows = poolWindows(source, pool, host.now());
+  keepPoolMembers(state, source, pool);
+  for (const w of windows) {
+    record(state, `${source}-pool`, w, 60); // the hub caches a minute: at most a row a minute
+  }
+  return {
+    windows,
+    banked: null, // each account's own; the pool's pacing does not count on them
+    note: null,
+    via: "hub",
+    credits: null,
+    lanes: await laneReading(state, source, host),
+    tokens: await tokenReading(state, source, host),
+    pool,
+  };
+}
+
+/**
+ * A source's reading: the hub's pool when this machine's Claude Code or Codex goes through a
+ * hub that runs `agent-pace hub serve`, this machine's own otherwise.
+ */
+export async function readSource(source: Source, state: string, host: Host): Promise<ReadingWithLanes> {
+  const login = hubLogin(source, host);
+  const pool =
+    login === null
+      ? null
+      : await hubReading(source, login, state, host, (error) => fetchFailure(error, host));
+  if (pool !== null) {
+    return readPool(source, pool, state, host);
+  }
   return source === "claude" ? readClaude(state, host) : readCodex(state, host);
+}
+
+/** Whose history a reading's windows are kept in. */
+export function historyKey(source: Source, reading: ReadingWithLanes): HistoryKey {
+  return reading.pool ? `${source}-pool` : source;
+}
+
+/**
+ * A reading assessed against its history. A pool's windows move their reset each time one of
+ * its accounts resets, which is no end of the pool's window: a pool says nothing of a
+ * previous window.
+ */
+export function assessReading(
+  source: Source,
+  reading: ReadingWithLanes,
+  options: PaceOptions,
+  now: number,
+): WindowAssessment[] {
+  const res = assess(
+    historyKey(source, reading),
+    reading.windows,
+    options,
+    reading.banked,
+    reading.lanes,
+    now,
+    reading.tokens,
+    reading.credits,
+  );
+  return reading.pool ? res.map((a) => ({ ...a, previousWindowEndedAt: null })) : res;
 }
