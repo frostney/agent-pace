@@ -308,14 +308,16 @@ agent-pace then asks that address, at `<hub>/agent-pace/v1/usage/<claude|codex>`
 same access key: a client needs no other secret. Only an https address (or plain http to this
 machine itself) is asked. It is a hub when the answer carries the `X-Agent-Pace-Hub` header
 that `agent-pace hub serve` puts on every answer; then the pool is read and the machine's own
-login never is, and the address is remembered as a hub (`<source>-pool-hub`). Until an address
+login never is, and the address is remembered as a hub (`<source>-pool-hub`). An address not
+met yet is first asked `<hub>/agent-pace/v1/hub`, which the service answers at once without
+reading any account, so a hub whose accounts take long to read is still known as one. Until an address
 has answered so, any other answer or none (a gateway that is no hub, a hub without the service,
 a local router that is not running) leaves agent-pace reading this machine as before, as does a
 plain-http address elsewhere or a config without a key. Once it has, an answer without the
 header or none is a failed reading, as an unreachable usage endpoint is: a hub whose service is
 down is still the hub, and this machine's own login is not the one in use (remove
 `<source>-pool-hub` when an address no longer runs the service). An address not yet known as
-a hub is given 10 seconds to answer, a known hub 90. On the hub machine
+a hub is given 10 seconds to answer that, a known hub 90 for its accounts. On the hub machine
 itself, Claude Code and Codex point at CLIProxyAPI's own port, which is no agent-pace service, so
 agent-pace there reads that machine as before.
 
@@ -401,7 +403,8 @@ under `/agent-pace`. Its options:
 | `--state DIR`    | `~/.local/state/agent-pace` | where the Claude Code version it claims is remembered          |
 - **Requests:** `GET /v1/usage/claude` and `GET /v1/usage/codex` (the same under
   `/agent-pace/`), with `Authorization: Bearer <access key>`, the key in `access-key`, compared
-  in constant time. Without it: 401. Anything else: 404, or 405 for another method.
+  in constant time. Without it: 401. `GET /v1/hub` with the key answers `{"version": 1}` without
+  reading any account. Anything else: 404, or 405 for another method.
 - **Upstream:** only GETs. For a Claude account, the usage endpoint Claude Code's `/usage`
   reads (as above, with `?cedar_ember=1` for the banked resets). For a Codex account,
   `https://chatgpt.com/backend-api/wham/usage`, the endpoint Codex reads its rate limits from,

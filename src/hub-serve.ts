@@ -23,7 +23,7 @@ import {
 } from "./claude.ts";
 import { CODEX_RESET_CREDITS_URL, CODEX_USAGE_URL, codexResetCredits, codexUsageWindows } from "./codex.ts";
 import { defaultStateDirectory, type Host, homeDirectory } from "./host.ts";
-import { HUB_ANSWER_VERSION, HUB_HEADER } from "./hub.ts";
+import { HUB_ANSWER_VERSION, HUB_HEADER, HUB_HELLO } from "./hub.ts";
 import { numberText, parseIntText } from "./python-format.ts";
 import {
   dumps,
@@ -440,7 +440,9 @@ export function hubHandler(options: HubServeOptions, host: Host): (request: Requ
   return async (request) => {
     const path = new URL(request.url).pathname.replace(/^\/agent-pace(?=\/)/, "");
     const provider = SOURCES.find((s) => path === `/v1/usage/${s}`);
-    if (provider === undefined) {
+    // /v1/hub says this is the service without reading any account, so a client that has not
+    // met this address yet can tell it from a gateway within a short wait
+    if (provider === undefined && path !== HUB_HELLO) {
       return answer(404, { error: "not found" });
     }
     if (request.method !== "GET") {
@@ -449,6 +451,9 @@ export function hubHandler(options: HubServeOptions, host: Host): (request: Requ
     try {
       if (!authorized(request, keyFile(options, "access-key"))) {
         return answer(401, { error: "the hub's access key is required" }, { "www-authenticate": "Bearer" });
+      }
+      if (provider === undefined) {
+        return answer(200, { version: HUB_ANSWER_VERSION });
       }
       return answer(200, await cached(provider));
     } catch (error) {

@@ -519,6 +519,18 @@ describe("HubService", () => {
     expect([bob.state, (bob.windows as Fields[]).map((w) => w.name)]).toEqual(["ok", ["7d"]]);
   });
 
+  test("/v1/hub says it is the service, behind the access key, without reading any account", async () => {
+    const handle = service();
+    expect((await handle(get("/agent-pace/v1/hub", null))).status).toBe(401);
+    const hello = await handle(get("/agent-pace/v1/hub"));
+    expect([hello.status, hello.headers.get("x-agent-pace-hub"), await hello.text()]).toEqual([
+      200,
+      "1",
+      '{"version": 1}\n',
+    ]);
+    expect(cliproxy.calls).toEqual([]);
+  });
+
   test("without the access key, or with another, nothing is read", async () => {
     const handle = service();
     for (const key of [null, "sk-wrong", `${ACCESS_KEY}x`, MANAGEMENT_KEY]) {
@@ -670,7 +682,10 @@ describe("HubClient", () => {
         "  claude 4: unreadable (HTTP 401), left out of the pool\n",
     );
     // the leftover local login (CLAUDE_CODE_OAUTH_TOKEN) is never read
-    expect(c.requests.map((r) => r.url)).toEqual([`${HUB}/agent-pace/v1/usage/claude`]);
+    expect(c.requests.map((r) => r.url)).toEqual([
+      `${HUB}/agent-pace/v1/hub`,
+      `${HUB}/agent-pace/v1/usage/claude`,
+    ]);
     expect(c.requests[0]?.headers.get("authorization")).toBe(`Bearer ${ACCESS_KEY}`);
     // the pool keeps its own history, beside the local login's
     expect(readFileSync(join(c.state, "claude-pool-5h.csv"), "utf8")).toBe(`${NOW},55.0,${NOW + 6300}\r\n`);
@@ -808,7 +823,7 @@ describe("HubClient", () => {
     const [out, err] = await c.runPace("claude");
     expect(err).toBe("");
     expect(out).toStartWith("12:25 claude: 5h 6% ");
-    expect(c.requests.map((r) => r.url)).toEqual([`${HUB}/agent-pace/v1/usage/claude`, USAGE_URL]);
+    expect(c.requests.map((r) => r.url)).toEqual([`${HUB}/agent-pace/v1/hub`, USAGE_URL]);
     c.hubFetch = async () => new Response('{"detail": "Not Found"}', { status: 401 });
     expect((await c.runPace("claude"))[0]).toStartWith("12:25 claude: 5h 6% ");
   });
@@ -887,6 +902,20 @@ describe("HubClient", () => {
     expect(readFileSync(join(c.state, "claude-pool-5h.csv"), "utf8").split("\r\n")).toHaveLength(2);
   });
 
+  test("a hub met for the first time is known before its accounts are read", async () => {
+    connect();
+    claudeClient();
+    const usage = c.hubFetch as (url: string, init: RequestInit) => Promise<Response>;
+    // the accounts cannot be read yet, but the hub has said it is one: no fallback to this machine
+    c.hubFetch = async (url, init) =>
+      url.endsWith("/v1/hub") ? usage(url, init) : Promise.reject(new Error("still reading upstream"));
+    const [out, err] = await c.runPace("claude");
+    expect(out).toBe("");
+    expect(err).toStartWith("agent-pace: <urlopen error ");
+    expect(readFileSync(join(c.state, "claude-pool-hub"), "utf8")).toBe(HUB);
+    expect(c.requests.map((r) => r.url)).not.toContain(USAGE_URL);
+  });
+
   test("once an address has answered as a hub, a missing service is a failed reading, not this machine's login", async () => {
     connect();
     claudeClient();
@@ -914,7 +943,7 @@ describe("HubClient", () => {
     };
     const [out, err] = await c.runPace("claude");
     expect([err, out.split(" (")[0]]).toEqual(["", "12:25 claude: 5h 6% ? 1.17h left"]);
-    expect(c.requests.map((r) => r.url)).toEqual([`${HUB}/agent-pace/v1/usage/claude`, USAGE_URL]);
+    expect(c.requests.map((r) => r.url)).toEqual([`${HUB}/agent-pace/v1/hub`, USAGE_URL]);
   });
 
   test("--json's hub keys come in a fixed order", async () => {

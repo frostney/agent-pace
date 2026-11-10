@@ -17,6 +17,9 @@ export const HUB_ANSWER_VERSION = 1;
 /** The header on every answer of `agent-pace hub serve`: an address without it is no hub. */
 export const HUB_HEADER = "x-agent-pace-hub";
 
+/** Answers with the service's header and nothing else: how a client first meets a hub. */
+export const HUB_HELLO = "/v1/hub";
+
 /** Where a hub client sends its usage request, under the hub's own address. */
 export const HUB_PATH = "/agent-pace/v1/usage";
 
@@ -267,14 +270,38 @@ export async function hubReading(
   host: Host,
   fetchFailure: (error: unknown) => string,
 ): Promise<HubPool | null> {
+  const headers = { Authorization: `Bearer ${login.key}` };
+  if (!confirmed(state, source, login.url)) {
+    // an address not met yet (a gateway, perhaps) gets 10 s to say it is the service, which
+    // answers that without reading any account
+    let hello: Response;
+    try {
+      hello = await host.fetch(`${login.url}/agent-pace${HUB_HELLO}`, {
+        headers,
+        signal: AbortSignal.timeout(10_000),
+      });
+    } catch {
+      return null;
+    }
+    if (hello.headers.get(HUB_HEADER) === null) {
+      return null;
+    }
+    if (hello.status === 401 || hello.status === 403) {
+      throw new ExitError(`agent-pace: the hub at ${login.url} rejected the access key in ${login.from}`);
+    }
+    if (hello.status !== 200) {
+      return null; // a service without the greeting (another version) is met through usage, as below
+    }
+    confirm(state, source, login.url);
+  }
   const known = confirmed(state, source, login.url);
   const url = `${login.url}${HUB_PATH}/${source}`;
   // a hub's cold read asks every account upstream (up to 15 s for the list and 2 x 20 s for a
-  // Codex account); an address not yet known as a hub (a gateway, perhaps) gets 10 s
+  // Codex account)
   const signal = AbortSignal.timeout(known ? 90_000 : 10_000);
   let response: Response;
   try {
-    response = await host.fetch(url, { headers: { Authorization: `Bearer ${login.key}` }, signal });
+    response = await host.fetch(url, { headers, signal });
   } catch (error) {
     if (!known) {
       return null;
