@@ -461,7 +461,7 @@ export function hubHandler(options: HubServeOptions, host: Host): (request: Requ
         error instanceof HubFailure
           ? error
           : new HubFailure(500, "the hub's agent-pace failed reading the accounts");
-      host.stderr(`agent-pace hub: ${provider}: ${failure.message}\n`);
+      host.stderr(`agent-pace hub: ${provider ?? "hub"}: ${failure.message}\n`);
       return answer(failure.status, { error: failure.message });
     }
   };

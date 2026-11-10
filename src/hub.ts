@@ -289,9 +289,8 @@ export async function hubReading(
     if (hello.status === 401 || hello.status === 403) {
       throw new ExitError(`agent-pace: the hub at ${login.url} rejected the access key in ${login.from}`);
     }
-    if (hello.status !== 200) {
-      return null; // a service without the greeting (another version) is met through usage, as below
-    }
+    // the header says it is the service: any other answer (an older service without /v1/hub, a
+    // hub that cannot read its keys) is the usage request's to report
     confirm(state, source, login.url);
   }
   const known = confirmed(state, source, login.url);

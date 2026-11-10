@@ -916,6 +916,23 @@ describe("HubClient", () => {
     expect(c.requests.map((r) => r.url)).not.toContain(USAGE_URL);
   });
 
+  test("a hub that answers /v1/hub with an error is still the hub", async () => {
+    claudeClient();
+    c.hubFetch = async () =>
+      new Response('{"error": "the hub\'s access-key file cannot be read"}\n', {
+        status: 503,
+        headers: { "x-agent-pace-hub": "1" },
+      });
+    expect(await c.runPace("claude")).toEqual([
+      "",
+      "agent-pace: the hub: the hub's access-key file cannot be read\n",
+    ]);
+    expect(c.requests.map((r) => r.url)).toEqual([
+      `${HUB}/agent-pace/v1/hub`,
+      `${HUB}/agent-pace/v1/usage/claude`,
+    ]);
+  });
+
   test("once an address has answered as a hub, a missing service is a failed reading, not this machine's login", async () => {
     connect();
     claudeClient();
