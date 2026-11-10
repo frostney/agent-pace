@@ -18,17 +18,28 @@
   once a window is at its limit (the "on usage credits" lane wording and routing, the
   `lanes.pool` and `usage_credits` fields, `<source>-credits.csv` and the `credits` key in
   `claude-banked.json`), the default `--target` of 100 and `--band` of 3 where the Python
-  version had 97 and 7 (the aim, the alert band, and every number and status they set) and `tokens-<source>.json`, which the Python version
+  version had 97 and 7 (the aim, the alert band, and every number and status they set),
+  reading a CLIProxyAPI hub's pool on a machine that goes through one (the pool's line name,
+  the account lines, the `hub` field, `via: "hub"`, the `<source>-pool-<window>.csv` and
+  `<source>-pool-members` and `<source>-pool-hub` files and
+  `agent-pace hub serve` with its help, errors and answer; on a machine without a hub nothing
+  changes, and `hub` is dispatched before the source parser so the sources' help and usage
+  errors stay as they were) and `tokens-<source>.json`, which the Python version
   did not have. Number formatting goes through `src/python-format.ts` and JSON through `src/python-json.ts`;
   never use `toFixed`, `String(number)` or `JSON.stringify` for output. A change to any of these
   is a breaking change and needs its own release note.
 - Never run agent-pace against the real backends or the real state while developing: no
   `agent-pace claude` without `--state` pointing at a scratch directory and a dummy
   `CLAUDE_CODE_OAUTH_TOKEN`, and no real `codex` on `PATH`. A run without `--state` appends to
-  the user's history and calls the live usage endpoint with their login.
+  the user's history and calls the live usage endpoint with their login. Likewise no
+  `agent-pace hub serve` with the real key files or a real CLIProxyAPI, and no client run with a
+  real `settings.json` or `config.toml` that points at a hub.
 - agent-pace only reads. It never redeems or claims a reset or buys credits, its Claude calls
   stay `GET`s of the usage endpoint and the prepaid balance, and the Codex exchange stays
-  `initialize`, `initialized`, `account/rateLimits/read`.
+  `initialize`, `initialized`, `account/rateLimits/read`. `hub serve` makes only `GET`s
+  upstream (through CLIProxyAPI's `api-call`), keeps the management key on the hub (CLIProxyAPI
+  on 127.0.0.1 only, and it listens on 127.0.0.1 only), and never answers with a token, an email
+  address or an upstream body.
 
 ## Runtime / Commands
 
@@ -54,6 +65,9 @@ bun bin/agent-pace.ts --help
 - `src/assess.ts` turns windows and history into targets, banked-reset advice and lane
   headroom, on the plan or, once a window is at its limit, on the usage credits;
   `src/report.ts` words it as text and JSON; `src/plan.ts` is `agent-pace plan`.
+- `src/hub.ts` finds a hub client (Claude Code's `settings.json`, Codex's `config.toml`), reads
+  the hub and pools its accounts' windows; `src/hub-serve.ts` is `agent-pace hub serve`, the
+  service on the hub. The pool's text and `--json` are in `src/report.ts`.
 - `src/host.ts` is everything taken from the machine (clock, env, fetch, output). Tests pass
   their own host instead of patching globals.
 
@@ -65,6 +79,8 @@ bun bin/agent-pace.ts --help
   passes the Python version's defaults, `--target 97` and `--band 7`, except where a test gives
   its own or sets `currentDefaults`.
 - Tests never touch the network, the real `~/.claude`, `~/.codex` or state directory.
+- `tests/hub.test.ts` runs `hub serve`'s handler against a fake CLIProxyAPI management API, and
+  hub clients through it; the one listener a test starts binds port 0 on 127.0.0.1.
 - `tests/command.test.ts` covers what the Python suite did not (exit statuses, the usage
   endpoint's error answers, help, `--watch`, `--notify`, a pacing constant); its expectations
   are the Python version's output for the same inputs.

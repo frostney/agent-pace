@@ -47,7 +47,41 @@ export interface UsageCredits {
   readonly places: number;
 }
 
-export type Via = "usage-api" | "app-server" | "session-logs";
+export type Via = "usage-api" | "app-server" | "session-logs" | "hub";
+
+/** Whose readings a history file holds: this machine's login (`claude`) or a hub's pool (`claude-pool`). */
+export type HistoryKey = Source | `${Source}-pool`;
+
+/** An account on a CLIProxyAPI hub: read (`ok`), turned off on the hub, or not readable now. */
+export type HubAccountState = "ok" | "disabled" | "unreadable";
+
+/** One account on the hub as `agent-pace hub serve` reports it. */
+export interface HubAccount {
+  /** The credential's note on the hub, or the provider and its place in the hub's list. */
+  readonly label: string;
+  /** The plan the provider names (Codex), or null. */
+  readonly plan: string | null;
+  /** The credential's weight on the hub; null when it sets none. */
+  readonly weight: number | null;
+  readonly state: HubAccountState;
+  /** Why it is unreadable, or why its reading is an older one, such as "HTTP 429"; null otherwise. */
+  readonly detail: string | null;
+  /** When its windows were read; earlier than the pool's reading when the last read failed. */
+  readonly readAt: number | null;
+  /** The hub has stopped routing to it for now (a cooldown, often a limit reached). */
+  readonly coolingDown: boolean;
+  readonly windows: readonly UsageWindow[];
+  /** Its banked resets; null when they cannot be known. */
+  readonly banked: Banked | null;
+}
+
+/** A provider's accounts on the hub, read at once. */
+export interface HubPool {
+  /** The hub's address, as this machine's Claude Code or Codex reaches it. */
+  readonly url: string;
+  readonly observedAt: number;
+  readonly accounts: readonly HubAccount[];
+}
 
 /** A source's reading: its windows and banked resets (null when they cannot be known). */
 export interface Reading {
@@ -63,4 +97,6 @@ export interface ReadingWithLanes extends Reading {
   readonly lanes: LaneReading;
   /** What each lane spent lately, from the agents' session files; null without a ledger. */
   readonly tokens: TokenUse | null;
+  /** On a hub client: the accounts the windows pool. */
+  readonly pool?: HubPool;
 }

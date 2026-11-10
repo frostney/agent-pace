@@ -11,10 +11,11 @@ import {
   type WindowAssessment,
 } from "./assess.ts";
 import { RESET_JITTER_S } from "./history.ts";
-import { floatRepr, formatFixed, numberText, roundToInt } from "./python-format.ts";
+import { capacity, enabled, inPool, poolName } from "./hub.ts";
+import { floatRepr, formatFixed, numberText, roundTo, roundToInt } from "./python-format.ts";
 import { float, type Json, type JsonObject } from "./python-json.ts";
-import { isoOrNull, localClock, localStamp, parseIso } from "./time-format.ts";
-import type { Reading, ReadingWithLanes, Source } from "./usage.ts";
+import { isoOrNull, isoUtc, localClock, localStamp, parseIso } from "./time-format.ts";
+import type { Banked, HubAccount, HubPool, Reading, ReadingWithLanes, Source } from "./usage.ts";
 
 /** An amount of usage credits with its unit, such as "429.39 GBP". */
 export function creditAmount(x: number, credits: CreditPlan): string {
@@ -64,6 +65,7 @@ export function render(
   res: readonly WindowAssessment[],
   now: number,
   timeZone: string | undefined,
+  name: string = source,
 ): string {
   const parts = res.map((a) => {
     let note = BASIS_NOTE[a.rateBasis ?? "recent"];
@@ -114,7 +116,7 @@ export function render(
     const age = (now - parseIso(first.observedAt)) / 60;
     stale = age >= 10 ? ` (snapshot ${formatFixed(age, 0)} min old)` : "";
   }
-  return `${localClock(now, timeZone)} ${source}${stale}: ${parts.join(" | ")}`;
+  return `${localClock(now, timeZone)} ${name}${stale}: ${parts.join(" | ")}`;
 }
 
 export function perHour(x: number | null): string {
@@ -127,6 +129,11 @@ export class Wording {
 
   local(iso: string | null): string {
     return iso === null ? "None" : localStamp(parseIso(iso), this.timeZone);
+  }
+
+  /** A unix time on the reader's clock. */
+  at(t: number): string {
+    return localStamp(t, this.timeZone);
   }
 
   /** When the next banked reset expires, as text. */
@@ -191,7 +198,10 @@ export function bankedLines(source: Source, res: readonly WindowAssessment[], wo
 
 /** The banked resets as --json reports them. */
 export function bankedJson(reading: Reading): JsonObject {
-  const banked = reading.banked;
+  return { ...bankJsonOf(reading.banked), via: reading.via, note: reading.note };
+}
+
+function bankJsonOf(banked: Banked | null): JsonObject {
   const credits =
     banked?.credits == null
       ? null
@@ -200,8 +210,6 @@ export function bankedJson(reading: Reading): JsonObject {
     known: banked !== null,
     count: banked === null ? null : banked.count,
     credits,
-    via: reading.via,
-    note: reading.note,
   };
 }
 
@@ -295,14 +303,94 @@ export function windowJson(a: WindowAssessment): JsonObject {
   };
 }
 
-/** One source's reading as --json reports it. */
-export function sourceJson(reading: ReadingWithLanes, res: readonly WindowAssessment[]): JsonObject {
+/** One source's reading as --json reports it; a hub client's adds the accounts it pools. */
+export function sourceJson(
+  reading: ReadingWithLanes,
+  res: readonly WindowAssessment[],
+  now: number,
+): JsonObject {
   return {
     windows: res.map(windowJson),
     banked_resets: bankedJson(reading),
     lanes: lanesJson(res),
     usage_credits: creditsJson(res),
+    ...(reading.pool ? { hub: hubJson(reading.pool, now) } : {}),
   };
+}
+
+/** The hub's accounts as --json reports them, with what the pool takes from each. */
+export function hubJson(pool: HubPool, now: number): JsonObject {
+  const members = pool.accounts.filter(inPool);
+  return {
+    url: pool.url,
+    observed_at: isoUtc(pool.observedAt),
+    accounts_in_pool: members.length,
+    accounts_enabled: enabled(pool).length,
+    pool_capacity: members.reduce((sum, a) => sum + capacity(a), 0),
+    accounts: pool.accounts.map((a) => ({
+      label: a.label,
+      plan: a.plan,
+      weight: a.weight,
+      capacity: capacity(a),
+      in_pool: inPool(a),
+      state: a.state,
+      detail: a.detail,
+      read_at: isoOrNull(a.readAt),
+      cooling_down: a.coolingDown,
+      windows: a.windows.map((w) => ({
+        window: w.name,
+        used: float(w.used),
+        resets_at: isoUtc(w.resetsAt),
+        hours_left: float(roundTo(Math.max(0, (w.resetsAt - now) / 3600), 2)),
+      })),
+      banked_resets: bankJsonOf(a.banked),
+    })),
+  };
+}
+
+/** What one account's banked resets say, such as "2 banked, next expires Sat 15 Nov 10:00". */
+function accountBanked(banked: Banked | null, words: Wording): string | null {
+  if (banked === null || banked.count === 0) {
+    return null;
+  }
+  const expiries = (banked.credits ?? []).flatMap((c) => (c.expiresAt === null ? [] : [c.expiresAt]));
+  const next = expiries.length > 0 ? `next expires ${words.at(Math.min(...expiries))}` : "expiry unknown";
+  return `${banked.count} banked, ${next}`;
+}
+
+/** One line for one account on the hub: its windows, resets and banked resets, or why it is left out. */
+function accountLine(a: HubAccount, now: number, words: Wording): string {
+  const about = [a.plan, a.weight === null ? null : `weight ${a.weight}`].filter((x) => x !== null);
+  const head = `${a.label}${about.length > 0 ? ` (${about.join(", ")})` : ""}`;
+  if (a.state === "disabled") {
+    return `${head}: disabled on the hub, not in the pool`;
+  }
+  if (a.state === "unreadable") {
+    return `${head}: unreadable${a.detail ? ` (${a.detail})` : ""}, left out of the pool`;
+  }
+  const windows = a.windows.map((w) => {
+    const left = Math.max(0, (w.resetsAt - now) / 3600);
+    return `${w.name} ${formatFixed(w.used, 0)}% resets ${words.at(w.resetsAt)} (in ${formatFixed(left, 1)}h)`;
+  });
+  const notes = [
+    // the last good reading stands in while a read fails (a 429 is left alone as long as it asks)
+    a.detail && a.readAt !== null ? `as read ${words.at(a.readAt)} (now ${a.detail})` : null,
+    accountBanked(a.banked, words),
+    a.coolingDown ? "cooling down on the hub" : null,
+    capacity(a) > 0 ? null : "weight 0, left out of the pool",
+  ].filter((x) => x !== null);
+  const body = windows.length > 0 ? windows.join(" | ") : "no window running";
+  return `${head}: ${body}${notes.length > 0 ? `; ${notes.join("; ")}` : ""}`;
+}
+
+/** The lines under a pooled reading: one per account on the hub. */
+export function accountLines(pool: HubPool, now: number, words: Wording): string[] {
+  return pool.accounts.map((a) => accountLine(a, now, words));
+}
+
+/** What a reading's line is called: the source, or its pool on a hub client. */
+export function readingName(source: Source, reading: ReadingWithLanes): string {
+  return reading.pool ? poolName(source, reading.pool) : source;
 }
 
 /** The lines under a source's reading: what to do with its banked resets, then its note. */

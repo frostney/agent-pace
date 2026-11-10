@@ -1,13 +1,14 @@
 import { basename } from "node:path";
 import { ArgumentParser, type Options } from "./arguments.ts";
-import { assess, laneSummary } from "./assess.ts";
+import { laneSummary } from "./assess.ts";
 import { ExitError, OsError, RateLimited, survivableErrorText } from "./errors.ts";
 import { commandLine, defaultStateDirectory, type Host, systemHost } from "./host.ts";
+import { hubMain } from "./hub-serve.ts";
 import { runPlan } from "./plan.ts";
 import { parseIntText, stringRepr } from "./python-format.ts";
 import { dumps } from "./python-json.ts";
-import { readSource } from "./readings.ts";
-import { noteLines, render, rollovers, sourceJson, Wording } from "./report.ts";
+import { assessReading, readSource } from "./readings.ts";
+import { accountLines, noteLines, readingName, render, rollovers, sourceJson, Wording } from "./report.ts";
 import { shellWords } from "./shell-words.ts";
 import type { Source } from "./usage.ts";
 
@@ -38,23 +39,14 @@ async function pace(source: Source, options: Options, host: Host): Promise<numbe
     try {
       const reading = await readSource(source, options.state, host);
       const now = host.now();
-      const res = assess(
-        source,
-        reading.windows,
-        options,
-        reading.banked,
-        reading.lanes,
-        now,
-        reading.tokens,
-        reading.credits,
-      );
+      const res = assessReading(source, reading, options, now);
       let messages = rollovers(source, res, seen);
       if (first) {
         messages = []; // only announce resets that happen while watching
       }
       first = false;
       if (options.json) {
-        host.stdout(`${dumps({ source, ...sourceJson(reading, res) })}\n`);
+        host.stdout(`${dumps({ source, ...sourceJson(reading, res, host.now()) })}\n`);
       } else {
         // banked resets that need acting on (redeem now, or redeem anyway) alert too
         const due = res.some(
@@ -65,11 +57,15 @@ async function pace(source: Source, options: Options, host: Host): Promise<numbe
         const alert =
           lead?.status === "over" || (lead?.status === "under" && laneSummary(res)[0] !== 0) || due;
         const extra = noteLines(source, res, reading, words);
-        const line = render(source, res, host.now(), host.timeZone);
-        const lines = [...messages, ...(!options.alertsOnly || alert ? [line, ...extra] : [])];
+        const accounts = reading.pool
+          ? accountLines(reading.pool, host.now(), words).map((l) => `  ${l}`)
+          : [];
+        const line = render(source, res, host.now(), host.timeZone, readingName(source, reading));
+        const lines = [...messages, ...(!options.alertsOnly || alert ? [line, ...extra, ...accounts] : [])];
         host.stdout(lines.map((l) => `${l}\n`).join(""));
         // alerts follow the shortest window, the one agents are paced by; longer ones ride along in the line
         if (options.notify && (messages.length > 0 || alert)) {
+          // the pool's line speaks for the hub; its account lines stay out of the alert
           notify(options.notify, [...messages, line, ...extra].join(" "), host);
         }
       }
@@ -115,6 +111,10 @@ export async function main(argv: readonly string[], prog: string, host: Host): P
     : prog.startsWith("codex")
       ? "codex"
       : null;
+  if (implied === null && argv[0] === "hub") {
+    // the service on a CLIProxyAPI hub; kept out of the sources so their help stays as it was
+    return hubMain(argv.slice(1), `${prog} hub`, host);
+  }
   const parser = new ArgumentParser(prog, implied, terminalColumns(host));
   const parsed = parser.parse(argv, defaultStateDirectory(host.env));
   if (parsed.kind === "help") {

@@ -165,6 +165,8 @@ export class Case {
   /** Runs before each sleep returns, to change the world between watch readings. */
   between: (() => void) | null = null;
   readonly requests: { url: string; headers: Headers }[] = [];
+  /** Answers requests to a CLIProxyAPI hub (an https://hub.test address); null sends them to the usage endpoint. */
+  hubFetch: ((url: string, init: RequestInit) => Promise<Response>) | null = null;
 
   constructor() {
     for (const sub of ["bin", "state", "codex-home/sessions/2025/10/22"]) {
@@ -217,6 +219,9 @@ export class Case {
       monotonic: () => performance.now() / 1000,
       fetch: async (url, init) => {
         this.requests.push({ url, headers: new Headers(init.headers) });
+        if (this.hubFetch && url.startsWith("https://hub.test")) {
+          return this.hubFetch(url, init);
+        }
         if (this.claudeError) {
           throw this.claudeError;
         }
