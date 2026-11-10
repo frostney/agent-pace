@@ -5,6 +5,7 @@
 
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { constants } from "node:os";
 import { join } from "node:path";
 import { USAGE_URL } from "../src/claude.ts";
 import { main } from "../src/cli.ts";
@@ -948,7 +949,8 @@ describe("HubClient", () => {
       throw Object.assign(new Error("Unable to connect"), { code: "ConnectionRefused" });
     };
     expect((await c.runPace("claude"))[1]).toBe(
-      "agent-pace: <urlopen error [Errno 61] Connection refused>\n",
+      // The errno is the platform's own (61 on macOS, 111 on Linux), as src/claude.ts prints it.
+      `agent-pace: <urlopen error [Errno ${constants.errno.ECONNREFUSED}] Connection refused>\n`,
     );
     expect(c.requests.map((r) => r.url)).not.toContain(USAGE_URL);
   });
