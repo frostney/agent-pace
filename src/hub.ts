@@ -269,8 +269,9 @@ export async function hubReading(
 ): Promise<HubPool | null> {
   const known = confirmed(state, source, login.url);
   const url = `${login.url}${HUB_PATH}/${source}`;
-  // a cold read asks every account upstream (up to 15 s for the list and 2 x 20 s for a Codex account)
-  const signal = AbortSignal.timeout(90_000);
+  // a hub's cold read asks every account upstream (up to 15 s for the list and 2 x 20 s for a
+  // Codex account); an address not yet known as a hub (a gateway, perhaps) gets 10 s
+  const signal = AbortSignal.timeout(known ? 90_000 : 10_000);
   let response: Response;
   try {
     response = await host.fetch(url, { headers: { Authorization: `Bearer ${login.key}` }, signal });
@@ -285,7 +286,8 @@ export async function hubReading(
       return null;
     }
     throw new NetworkError(
-      `the hub at ${login.url} answered without its agent-pace service (HTTP ${response.status})`,
+      `the hub at ${login.url} answered without its agent-pace service (HTTP ${response.status}); ` +
+        `if it no longer runs one, remove ${confirmedPath(state, source)}`,
     );
   }
   confirm(state, source, login.url);

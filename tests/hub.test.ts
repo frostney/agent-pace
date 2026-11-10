@@ -895,7 +895,8 @@ describe("HubClient", () => {
     c.hubFetch = async () => new Response("Bad Gateway", { status: 502 });
     expect(await c.runPace("claude")).toEqual([
       "",
-      `agent-pace: the hub at ${HUB} answered without its agent-pace service (HTTP 502)\n`,
+      `agent-pace: the hub at ${HUB} answered without its agent-pace service (HTTP 502); ` +
+        `if it no longer runs one, remove ${join(c.state, "claude-pool-hub")}\n`,
     ]);
     c.hubFetch = async () => {
       throw Object.assign(new Error("Unable to connect"), { code: "ConnectionRefused" });

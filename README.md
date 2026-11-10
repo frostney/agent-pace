@@ -313,7 +313,9 @@ has answered so, any other answer or none (a gateway that is no hub, a hub witho
 a local router that is not running) leaves agent-pace reading this machine as before, as does a
 plain-http address elsewhere or a config without a key. Once it has, an answer without the
 header or none is a failed reading, as an unreachable usage endpoint is: a hub whose service is
-down is still the hub, and this machine's own login is not the one in use. On the hub machine
+down is still the hub, and this machine's own login is not the one in use (remove
+`<source>-pool-hub` when an address no longer runs the service). An address not yet known as
+a hub is given 10 seconds to answer, a known hub 90. On the hub machine
 itself, Claude Code and Codex point at CLIProxyAPI's own port, which is no agent-pace service, so
 agent-pace there reads that machine as before.
 
