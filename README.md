@@ -420,8 +420,8 @@ under `/agent-pace`. Its options:
   `used`, `resets_at`, `length_s`; times in unix seconds), `limits` (the names of the windows the
   account has a limit on, started or not, so a 5-hour window that has not started is told from
   a plan without one; null for Codex, which does not say, and for an account not read) and
-  `banked` (`count`, `credits` with
-  `expires_at`, `title`, `clears`; null when unknown), with the header `X-Agent-Pace-Hub: 1`.
+  `banked` (`count`, `credits` with `expires_at`, `title`, `clears`; null when unknown), with
+  the header `X-Agent-Pace-Hub: 1`.
   The `label` is the note the credential has on the hub (unless it looks like an email
   address), else the provider and its place in the hub's list ("claude 2"), which moves when an
   account is added: set a note for a lasting name. No token, email address or upstream body is
