@@ -20,7 +20,7 @@ Each [release](https://github.com/frostney/agent-pace/releases) has a standalone
 macOS and Linux (arm64 and x64), with `claude-pace` and `codex-pace` links beside it:
 
 ```sh
-version=5.1.0 target=darwin-arm64   # or darwin-x64, linux-x64, linux-arm64
+version=5.2.0 target=darwin-arm64   # or darwin-x64, linux-x64, linux-arm64
 curl -fsSL "https://github.com/frostney/agent-pace/releases/download/v$version/agent-pace-$version-$target.tar.gz" \
   | tar -xz -C ~/.local/bin --strip-components=1 \
       "agent-pace-$version-$target/agent-pace" \
@@ -417,8 +417,11 @@ under `/agent-pace`. Its options:
   `read_at` when it was read.
 - **Answer:** `{"version": 1, "provider", "observed_at", "accounts": [...]}`, each account with
   `label`, `plan`, `weight`, `cooling_down`, `state`, `detail`, `read_at`, `windows` (`name`,
-  `used`, `resets_at`, `length_s`; times in unix seconds) and `banked` (`count`, `credits` with
-  `expires_at`, `title`, `clears`; null when unknown), with the header `X-Agent-Pace-Hub: 1`.
+  `used`, `resets_at`, `length_s`; times in unix seconds), `limits` (the names of the windows the
+  account has a limit on, started or not, so a 5-hour window that has not started is told from
+  a plan without one; null for Codex, which does not say, and for an account not read) and
+  `banked` (`count`, `credits` with `expires_at`, `title`, `clears`; null when unknown), with
+  the header `X-Agent-Pace-Hub: 1`.
   The `label` is the note the credential has on the hub (unless it looks like an email
   address), else the provider and its place in the hub's list ("claude 2"), which moves when an
   account is added: set a note for a lasting name. No token, email address or upstream body is
