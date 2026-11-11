@@ -326,6 +326,7 @@ describe("HubService", () => {
             { name: "5h", used: 40, resets_at: NOW + 7200, length_s: 18000 },
             { name: "7d", used: 60, resets_at: NOW + 3 * 86400, length_s: 604800 },
           ],
+          limits: ["5h", "7d"],
           banked: {
             count: 1,
             credits: [{ expires_at: NOW + 2 * 86400, title: "One usage-limit reset", clears: ["5h", "7d"] }],
@@ -343,6 +344,7 @@ describe("HubService", () => {
             { name: "5h", used: 100, resets_at: NOW + 3600, length_s: 18000 },
             { name: "7d", used: 80, resets_at: NOW + 5 * 86400, length_s: 604800 },
           ],
+          limits: ["5h", "7d"],
           banked: null,
         },
         {
@@ -354,6 +356,7 @@ describe("HubService", () => {
           detail: null,
           read_at: null,
           windows: [],
+          limits: null,
           banked: null,
         },
         {
@@ -365,6 +368,7 @@ describe("HubService", () => {
           detail: "HTTP 401",
           read_at: null,
           windows: [],
+          limits: null,
           banked: null,
         },
       ],
@@ -385,6 +389,28 @@ describe("HubService", () => {
     );
   });
 
+  test("limits tells a window that has not started from one the plan does not have", async () => {
+    // a plan without a 5-hour limit answers five_hour: null; a 5-hour window not started yet
+    // is there without a resets_at; neither is a window to pace
+    (cliproxy.answers.a1 as Record<string, [number, unknown]>)[USAGE_URL] = [
+      200,
+      { five_hour: null, seven_day: { utilization: 72, resets_at: iso(NOW + 86400) } },
+    ];
+    (cliproxy.answers.b2 as Record<string, [number, unknown]>)[USAGE_URL] = [
+      200,
+      {
+        five_hour: { utilization: 0, resets_at: null },
+        seven_day: { utilization: 6, resets_at: iso(NOW + 86400) },
+      },
+    ];
+    const body = (await (await service()(get("/v1/usage/claude"))).json()) as Fields;
+    const [noSession, notStarted] = body.accounts as Fields[];
+    expect(noSession?.windows).toEqual([{ name: "7d", used: 72, resets_at: NOW + 86400, length_s: 604800 }]);
+    expect(noSession?.limits).toEqual(["7d"]);
+    expect(notStarted?.windows).toEqual([{ name: "7d", used: 6, resets_at: NOW + 86400, length_s: 604800 }]);
+    expect(notStarted?.limits).toEqual(["5h", "7d"]);
+  });
+
   test("Codex accounts carry their plan, weight and banked resets", async () => {
     const body = (await (await service()(get("/v1/usage/codex"))).json()) as Fields;
     expect(body.accounts).toEqual([
@@ -400,6 +426,7 @@ describe("HubService", () => {
           { name: "5h", used: 30, resets_at: NOW + 3600, length_s: 18000 },
           { name: "7d", used: 50, resets_at: NOW + 2 * 86400, length_s: 604800 },
         ],
+        limits: null,
         banked: { count: 1, credits: [{ expires_at: NOW + 86400, title: "Full reset", clears: null }] },
       },
       {
@@ -414,6 +441,7 @@ describe("HubService", () => {
           { name: "5h", used: 10, resets_at: NOW + 4 * 3600, length_s: 18000 },
           { name: "7d", used: 20, resets_at: NOW + 6 * 86400, length_s: 604800 },
         ],
+        limits: null,
         banked: { count: 0, credits: [] },
       },
     ]);

@@ -17,6 +17,7 @@ import {
   CLAUDE_CLI_FALLBACK,
   claudeBanked,
   claudeCliVersion,
+  claudeLimits,
   claudeUsageHeaders,
   claudeWindows,
   USAGE_URL,
@@ -155,6 +156,8 @@ async function upstream(
 
 interface AccountRead {
   readonly windows: UsageWindow[];
+  /** The windows it has a limit on, started or not; null when the provider does not say. */
+  readonly limits: string[] | null;
   readonly banked: Banked | null;
   readonly plan: string | null;
 }
@@ -178,6 +181,7 @@ async function readClaudeAccount(
   try {
     return {
       windows: claudeWindows(got.data, host.now()),
+      limits: claudeLimits(got.data),
       banked: claudeBanked(got.data).banked,
       plan: null,
     };
@@ -229,6 +233,7 @@ async function readCodexAccount(
   const tokenPlan = isRecord(account) ? account.plan_type : undefined;
   return {
     windows: usage.windows,
+    limits: null,
     banked,
     plan: usage.plan ?? (typeof tokenPlan === "string" && tokenPlan ? tokenPlan : null),
   };
@@ -373,6 +378,7 @@ async function readProvider(
         detail,
         read_at: null,
         windows: [],
+        limits: null,
         banked: null,
       });
       if (file.disabled === true) {
@@ -397,6 +403,7 @@ async function readProvider(
         detail: got.detail,
         read_at: float(got.at),
         windows: got.read.windows.map(windowJson),
+        limits: got.read.limits,
         banked: bankedJson(got.read.banked),
       };
     }),

@@ -358,6 +358,15 @@ export function claudeUsageHeaders(authorization: string, cliVersion: string): R
   };
 }
 
+/**
+ * The windows a usage response has a limit on, started or not: a window the plan does not
+ * limit is null (a plan without a 5-hour limit has `five_hour: null`); one that has not
+ * started is there with no `resets_at`.
+ */
+export function claudeLimits(data: unknown): string[] {
+  return CLAUDE_WINDOWS.filter(({ key }) => isRecord(get(data, key))).map(({ name }) => name);
+}
+
 /** The windows in a usage response; a window that has not started (no resets_at) is left out. */
 export function claudeWindows(data: unknown, now: number): UsageWindow[] {
   const windows: UsageWindow[] = [];
