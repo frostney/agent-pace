@@ -561,9 +561,22 @@ function bankPlan(
     .filter((e): e is number => e !== null)
     .sort((a, b) => a - b);
   const unlisted = banked.unlisted; // expiry not reported
-  const risky = known.find((e) => e < w.resetsAt) ?? null;
+  // a reset is at risk when it expires before the window it clears resets: a hub pool's, before
+  // its own account's window does
+  let first: Credit | null = null;
+  for (const c of banked.credits) {
+    const at = c.expiresAt;
+    if (
+      at !== null &&
+      at < (c.ownerResetsAt ?? w.resetsAt) &&
+      (first === null || at < (first.expiresAt ?? at))
+    ) {
+      first = c;
+    }
+  }
+  const risky = first?.expiresAt ?? null;
   // a hub pool's reset: only its own account has to be full by then (fill points of the pool)
-  const fill = risky === null ? undefined : banked.credits.find((c) => c.expiresAt === risky)?.fill;
+  const fill = first?.fill;
   let deadline: number | null;
   let horizon: number;
   if (risky !== null) {
@@ -578,8 +591,14 @@ function bankPlan(
   const left = fill ?? 100 - used + back;
   const needed = horizon > 0.05 ? left / horizon : null;
   let action: BankAction = "fill";
-  if (fill !== undefined && fill <= 0) {
-    action = "redeem"; // a hub pool's reset whose account is at its limit: nothing left to fill first
+  if (fill !== undefined) {
+    // a hub pool's reset expiring first goes by its own account, not the pool: redeem it once the
+    // account is full, or anyway when the account cannot be filled in time
+    if (fill <= 0) {
+      action = "redeem";
+    } else if (horizon <= 0.05 || (peak !== null && peak * horizon < fill)) {
+      action = "redeem-anyway";
+    }
   } else if (used >= Math.max(options.target, 100 - options.band)) {
     // at the limit, however low --target is set; with nothing about to expire, a window that
     // resets on its own soon would waste the reset (a reset whose expiry is not reported might
@@ -587,9 +606,7 @@ function bankPlan(
     action = risky === null && !unlisted && leftH <= options.redeemMargin ? "wait" : "redeem";
   } else if (risky !== null) {
     // the peak rate is at least the current one, so out of reach at the peak is out of reach now too
-    const outOfReach = (at: number) =>
-      fill === undefined ? used - back + at * horizon < 100 : at * horizon < fill;
-    if (horizon <= 0.05 || (peak !== null && outOfReach(peak))) {
+    if (horizon <= 0.05 || (peak !== null && used - back + peak * horizon < 100)) {
       action = "redeem-anyway";
     }
   }

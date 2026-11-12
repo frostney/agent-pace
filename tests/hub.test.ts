@@ -967,7 +967,9 @@ describe("HubClient", () => {
     const [out] = await c.runPace("claude");
     expect(out).toStartWith("12:25 claude pool (1 of 3 accounts): 5h 40% ? ");
     expect(readFileSync(join(c.state, "claude-pool-5h.csv"), "utf8")).toBe(`${NOW},40.0,${NOW + 7200}\r\n`);
-    expect(readFileSync(join(c.state, "claude-pool-members"), "utf8")).toBe("work\u00003\u0000fresh");
+    expect(readFileSync(join(c.state, "claude-pool-members"), "utf8")).toBe(
+      "work\u00003\u0000fresh\u00005h,7d",
+    );
   });
 
   test("an account standing in with an older reading, and read again, starts the history over each time", async () => {

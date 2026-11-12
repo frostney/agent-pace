@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assess, type PaceOptions } from "../src/assess.ts";
-import { poolBanked } from "../src/hub.ts";
+import { poolBanked, poolMembers } from "../src/hub.ts";
 import { recommend } from "../src/plan.ts";
 import { Wording } from "../src/report.ts";
 import type { Banked, HubAccount, LaneReading, UsageWindow } from "../src/usage.ts";
@@ -37,6 +37,26 @@ function day(used: number, leftH: number, returns: [number, number][] = []): Usa
     lengthS: 24 * H,
     observedAt: NOW,
     ...(returns.length > 0 ? { returns: returns.map(([h, p]) => [NOW + h * H, p] as const) } : {}),
+  };
+}
+
+function hubAccount(
+  label: string,
+  windows: UsageWindow[],
+  limits: string[],
+  banked: Banked | null,
+): HubAccount {
+  return {
+    label,
+    plan: null,
+    weight: null,
+    state: "ok",
+    detail: null,
+    readAt: NOW,
+    coolingDown: false,
+    windows,
+    limits,
+    banked,
   };
 }
 
@@ -123,6 +143,58 @@ describe("PoolBankedResets", () => {
     );
   });
 
+  test("a reset only clears the windows its account's plan limits", () => {
+    const banked = poolBanked({
+      url: "https://hub.test",
+      observedAt: NOW,
+      accounts: [
+        hubAccount(
+          "session only",
+          [{ name: "5h", used: 40, resetsAt: NOW + 2 * H, lengthS: 5 * H, observedAt: NOW }],
+          ["5h"],
+          {
+            count: 1,
+            credits: [{ expiresAt: NOW + 24 * H, title: null, clears: ["5h", "7d"] }],
+          },
+        ),
+        hubAccount(
+          "weekly",
+          [{ name: "7d", used: 60, resetsAt: NOW + 72 * H, lengthS: 168 * H, observedAt: NOW }],
+          ["7d"],
+          {
+            count: 0,
+            credits: [],
+          },
+        ),
+      ],
+    });
+    expect(banked?.credits?.map((c) => c.clears)).toEqual([["5h"]]);
+  });
+
+  test("no reset on the accounts read is no reset known while another's are unknown", () => {
+    const pool = (second: Banked | null) =>
+      poolBanked({
+        url: "https://hub.test",
+        observedAt: NOW,
+        accounts: [
+          hubAccount("a", [], ["7d"], { count: 0, credits: [] }),
+          hubAccount("b", [], ["7d"], second),
+        ],
+      });
+    expect(pool(null)).toBeNull();
+    expect(pool({ count: 0, credits: [] })).toEqual({ count: 0, credits: [] });
+  });
+
+  test("an account gaining or losing a window's limit starts the pool's history over", () => {
+    const members = (limits: string[]) =>
+      poolMembers({
+        url: "https://hub.test",
+        observedAt: NOW,
+        accounts: [hubAccount("a", [], limits, null)],
+      });
+    expect(members(["5h", "7d"])).not.toBe(members(["7d"]));
+  });
+
   test("an account that has not started the window the reset clears has all of it to fill", () => {
     const account = (label: string, windows: UsageWindow[], expiresInH: number): HubAccount => ({
       label,
@@ -146,26 +218,30 @@ describe("PoolBankedResets", () => {
     expect(banked?.credits?.map((c) => c.fill)).toEqual([20, 50]);
   });
 
-  test("an account that refills on its own before its reset expires has its next window to fill", () => {
-    const account = (label: string, used: number, resetsInH: number): HubAccount => ({
-      label,
-      plan: null,
-      weight: null,
-      state: "ok",
-      detail: null,
-      readAt: NOW,
-      coolingDown: false,
-      windows: [{ name: "7d", used, resetsAt: NOW + resetsInH * H, lengthS: 168 * H, observedAt: NOW }],
-      limits: ["7d"],
-      banked: { count: 1, credits: [{ expiresAt: NOW + 24 * H, title: null, clears: ["7d"] }] },
-    });
-    // full resets in an hour, a day before its reset expires: not at its limit for the reset's
-    // purpose, so nothing to redeem now; late resets after the expiry, so its 10% left is what counts
-    const banked = poolBanked({
-      url: "https://hub.test",
-      observedAt: NOW,
-      accounts: [account("full", 100, 1), account("late", 90, 48)],
-    });
-    expect(banked?.credits?.map((c) => c.fill)).toEqual([50, 5]);
+  test("a pooled reset is at risk by its own account's reset, not the pool's", () => {
+    // the pool resets in 10h; the reset expires in 30h, before its account's own window resets
+    // in 48h: at risk, though it outlasts the pool's reset
+    const late: Banked = {
+      count: 1,
+      credits: [
+        { expiresAt: NOW + 30 * H, title: null, clears: null, fill: 10, ownerResetsAt: NOW + 48 * H },
+      ],
+    };
+    expect(assess("claude-pool", [day(50, 10)], options, late, null, NOW)[0]?.banked?.mode).toBe("expiry");
+    // its account is full but refills on its own in an hour, a day before the reset expires: not
+    // at risk, so it is kept, as on one login
+    const refills: Banked = {
+      count: 1,
+      credits: [{ expiresAt: NOW + 24 * H, title: null, clears: null, fill: 0, ownerResetsAt: NOW + H }],
+    };
+    const [a] = assess("claude-pool", [day(50, 10)], options, refills, null, NOW);
+    expect([a?.banked?.mode, a?.banked?.action]).toEqual(["reset", "fill"]);
+  });
+
+  test("a pool near its limit redeems a pooled reset only once its account is full", () => {
+    // the pool at 98% with --target 97, but the reset's account still has 2 points to fill
+    options = { ...options, target: 97 };
+    const [a] = assess("claude-pool", [day(98, 10)], options, bankedWith(2), null, NOW);
+    expect(a?.banked?.action).toBe("fill");
   });
 });

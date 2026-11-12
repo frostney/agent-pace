@@ -28,6 +28,12 @@ export interface Credit {
    * reset is spent on, which is all that has to be filled before it expires.
    */
   readonly fill?: number;
+  /**
+   * A hub pool's reset only: when its account's window resets on its own. A reset that expires
+   * after that is not at risk, as on one login; one that expires before it only needs its
+   * account filled. Undefined while the account has not started that window.
+   */
+  readonly ownerResetsAt?: number;
 }
 
 /** The banked resets on an account; `credits` is null when only the count is known. */

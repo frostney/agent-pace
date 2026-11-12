@@ -438,8 +438,9 @@ export function poolWindows(source: Source, pool: HubPool, now: number): UsageWi
 export function poolBanked(pool: HubPool): Banked | null {
   const members = pool.accounts.filter(inPool);
   const known = members.filter((a) => a.banked !== null);
-  if (known.length === 0) {
-    return null;
+  const count = known.reduce((sum, a) => sum + (a.banked?.count ?? 0), 0);
+  if (known.length === 0 || (count === 0 && known.length < members.length)) {
+    return null; // none known, or none on the accounts read while another's are unknown
   }
   const total = (window: string) =>
     members.filter((a) => limitedBy(a, window)).reduce((sum, a) => sum + capacity(a), 0);
@@ -450,34 +451,38 @@ export function poolBanked(pool: HubPool): Banked | null {
       lengths.set(w.name, Math.max(lengths.get(w.name) ?? 0, w.lengthS));
     }
   }
-  // the account's room in the longest window the reset clears that its plan limits; a window it
-  // has not started is all room, and so is one that resets on its own before the reset expires
-  // (it refills, and its next window is what has to be full first)
-  const fill = (a: HubAccount, c: Credit): number | undefined => {
+  // the windows a reset of this account clears: only those its plan limits
+  const clears = (a: HubAccount, c: Credit): string[] | null =>
+    a.limits === null
+      ? c.clears === null
+        ? null
+        : [...c.clears]
+      : (c.clears ?? [...lengths.keys()]).filter((n) => limitedBy(a, n));
+  // the account's room in the longest of those the pool has (a window it has not started is all
+  // room), and when that window resets on its own
+  const pooled = (a: HubAccount, c: Credit): Credit => {
+    const cleared = clears(a, c);
     let longest: string | null = null;
     for (const [name, length] of lengths) {
-      const cleared = limitedBy(a, name) && (c.clears === null || c.clears.includes(name));
-      if (cleared && (longest === null || length > (lengths.get(longest) ?? 0))) {
+      if (
+        (cleared === null || cleared.includes(name)) &&
+        (longest === null || length > (lengths.get(longest) ?? 0))
+      ) {
         longest = name;
       }
     }
+    const credit = { ...c, clears: cleared };
     if (longest === null) {
-      return undefined;
+      return credit;
     }
     const own = a.windows.find((w) => w.name === longest);
-    const refills = own !== undefined && c.expiresAt !== null && own.resetsAt < c.expiresAt;
-    const used = own === undefined || refills ? 0 : own.used;
-    return (capacity(a) * (100 - used)) / total(longest);
+    const fill = (capacity(a) * (100 - (own?.used ?? 0))) / total(longest);
+    return own === undefined ? { ...credit, fill } : { ...credit, fill, ownerResetsAt: own.resetsAt };
   };
   return {
-    count: known.reduce((sum, a) => sum + (a.banked?.count ?? 0), 0),
+    count,
     // a reset whose account lists none is one with its expiry unknown: the count says it is there
-    credits: known.flatMap((a) =>
-      (a.banked?.credits ?? []).map((c) => {
-        const points = fill(a, c);
-        return points === undefined ? c : { ...c, fill: points };
-      }),
-    ),
+    credits: known.flatMap((a) => (a.banked?.credits ?? []).map((c) => pooled(a, c))),
   };
 }
 
@@ -499,11 +504,18 @@ function accountStates(accounts: readonly HubAccount[]): string {
  */
 export function poolMembers(pool: HubPool): string {
   // an account read again after standing in with an older reading moves the pool at once too
-  return pool.accounts
-    .filter(inPool)
-    .map((a) => `${a.label}\u0000${capacity(a)}\u0000${a.detail === null ? "fresh" : "stale"}`)
-    .sort()
-    .join("\n");
+  return (
+    pool.accounts
+      .filter(inPool)
+      // and so does one whose plan gains or loses a window's limit
+      .map(
+        (a) =>
+          `${a.label}\u0000${capacity(a)}\u0000${a.detail === null ? "fresh" : "stale"}` +
+          `\u0000${a.limits === null ? "" : a.limits.join(",")}`,
+      )
+      .sort()
+      .join("\n")
+  );
 }
 
 /** The pool as the reading's line names it: "claude pool (3 accounts)", "codex pool (1 of 2 accounts)". */

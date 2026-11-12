@@ -381,21 +381,23 @@ same.
   the pool's use drops and its reset time moves: that starts a new stretch, so the rate is
   measured again from there. It is no end of the pool's window, so a pool never says "window
   reset", and `previous_window_ended_at` is null. When an account joins or leaves the pool, or
-  its weight changes, or an account starts or stops standing in with an older reading, the
-  pool's use moves by more than anything burned: the pool's history starts over then (the accounts and shares of the last reading are kept in
+  its weight changes, or its plan gains or loses a window's limit, or an account starts or
+  stops standing in with an older reading, the pool's use moves by more than anything burned: the pool's history starts over then (the accounts and shares of the last reading are kept in
   `<source>-pool-members`), and the rate is measured afresh.
 - **Banked resets** of the accounts in the pool are the pool's: with one banked, the pool is
   paced as a window with a reset banked (see [Banked resets](#banked-resets)): it aims at 100%
   with no `--reserve` taper and no `slow down`, because when the pool runs out a reset refills
-  an account and the hub serves from it again. The pool's `banked_resets` lists them all
-  (`via: "hub"`), and each account's line lists its own. A reset that expires before the pool's
-  window resets only needs its own account filled first, `c·(100 - u) / Σ c` points of the
-  pool (all of it if the account has not started that window, or if that window resets on its
-  own before the reset expires), which the hub can route the pool's burn to: the banked line
-  says "fill its account by then" with the rate those points need, and to redeem at once when
-  the account is at its limit (`plan`: "a Claude hub account is at its limit"). The pool's own `lands
-  on 100%` stays its rate to its reset. A pool's banked line says to redeem on the hub (the hub
-  holds the logins; `/limit-reset` in a hub client's Claude Code does not reach them).
+  an account and the hub serves from it again. A reset clears only the windows its account's
+  plan limits. The pool's `banked_resets` lists them all (`via: "hub"`; unknown when the
+  accounts read have none and another account's cannot be read), and each account's line lists
+  its own. As on one login, a reset is at risk when it expires before the window it clears
+  resets, here its own account's window; then only that account has to be filled first,
+  `c·(100 - u) / Σ c` points of the pool (all of it if the account has not started that
+  window), which the hub can route the pool's burn to. The banked line says "fill its account
+  by then" with the rate those points need, and to redeem once the account is at its limit
+  (`plan`: "a Claude hub account is at its limit"). The pool's own `lands on 100%` stays its
+  rate to its reset. A pool's banked line says to redeem on the hub (the hub holds the logins;
+  `/limit-reset` in a hub client's Claude Code does not reach them).
 - **Usage credits** are not read through the hub.
 - **Lanes** are counted on this machine, as without a hub. Other machines' lanes draw on the
   same pool: their use shows in the pool's rate but not in the lane count, so the per-lane burn
