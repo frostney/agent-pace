@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { assess, type PaceOptions } from "../src/assess.ts";
 import { poolBanked, poolMembers } from "../src/hub.ts";
 import { recommend } from "../src/plan.ts";
-import { Wording } from "../src/report.ts";
+import { bankedLines, Wording } from "../src/report.ts";
 import type { Banked, HubAccount, LaneReading, UsageWindow } from "../src/usage.ts";
 
 const NOW = 1_800_000_000;
@@ -76,6 +76,19 @@ describe("PoolReturns", () => {
     // to the return at 2.5h; with the 40 points by the reset, 62 would fit
     const [a] = assess("claude-pool", [day(90, 3, [[2.5, 30]])], options, null, lanes(20), NOW);
     expect(a?.laneKeep).toBe(18);
+  });
+
+  test("slow down keeps this machine's lanes at their own burn, with the rest of the pool's going on", () => {
+    // the pool burns 4.29%/h by its average; this machine's 10 lanes 3%/h (0.3 each) by the last
+    // hour, so 1.29%/h is burned elsewhere: (10 - 1.29 * 3) / (0.3 * 3) fits 6, not the 7 that
+    // sharing the whole burn among these lanes would
+    writeFileSync(
+      join(state, "claude-pool-1d.csv"),
+      `${NOW - H},87.0,${NOW + 3 * H}\r\n${NOW},90.0,${NOW + 3 * H}\r\n`,
+    );
+    const counts = Array.from({ length: 13 }, (_, i) => [NOW - H + i * 300, 10] as [number, number]);
+    const [a] = assess("claude-pool", [day(90, 3)], options, null, lanes(10, counts), NOW);
+    expect([a?.status, a?.laneKeep]).toEqual(["over", 6]);
   });
 
   test("lane headroom fits the room before each return, not only at the reset", () => {
@@ -266,6 +279,18 @@ describe("PoolBankedResets", () => {
     };
     const [a] = assess("claude-pool", [day(50, 10)], options, two, null, NOW);
     expect([a?.banked?.mode, a?.banked?.expiresInH, a?.banked?.hoursToDeadline]).toEqual(["expiry", 8, 6]);
+  });
+
+  test("a pool at its limit keeps a reset whose full account refills on its own soon", () => {
+    const soon: Banked = {
+      count: 1,
+      credits: [{ expiresAt: NOW + 24 * H, title: null, clears: null, fill: 0, ownerResetsAt: NOW + H }],
+    };
+    const res = assess("claude-pool", [day(100, 50)], options, soon, null, NOW);
+    expect(res[0]?.banked?.action).toBe("wait");
+    expect(bankedLines("claude", res, new Wording("UTC"), true)).toEqual([
+      "at limit, but a full account refills on its own within 2.0h: keep the banked reset (1 left, next expires Sat 16 Jan 08:00)",
+    ]);
   });
 
   test("a pool at its limit redeems a reset only once its own account is full", () => {

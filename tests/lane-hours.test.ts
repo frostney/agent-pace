@@ -146,9 +146,9 @@ describe("NeverStop", () => {
   });
 
   test("slow down keeps fewer lanes than run", async () => {
-    // four lanes: 77 / (0.177 * 139.8) fits 3, one fewer than run
+    // four lanes at their own 0.2%/h each: 77 / (0.2 * 139.8) fits 2
     codexBurn(20, 0.8, 4, []);
-    expect((windows(await c.json("codex"))[0] as Fields).lane_keep).toBe(3);
+    expect((windows(await c.json("codex"))[0] as Fields).lane_keep).toBe(2);
   });
 
   test("slow down with no lane running here keeps one", async () => {

@@ -107,9 +107,10 @@ the 5h target), a weekly or full grant the 7d window.
 
 Pacing slows work; it never stops it. With no lane headroom the advice keeps the lanes running
 ("no lane headroom: start nothing new, keep the 3 lanes running"), or one when none is ("...
-but keep 1 lane running"). "slow down" says how many lanes fit to the window's reset, each at
-its share of the burn that set the status, so fewer than run now and never fewer than 1 ("slow
-down: keep 2 lanes running, start nothing new"). Only a window at its limit with nothing to
+but keep 1 lane running"). "slow down" says how many of this machine's lanes fit to the
+window's reset at their own per-lane burn, with the rest of the window's burn (other machines
+on a hub's pool) going on, or at an equal share of the burn while that is not measured; fewer
+than run now and never fewer than 1 ("slow down: keep 2 lanes running, start nothing new"). Only a window at its limit with nothing to
 redeem now and no usage credits cannot run a lane until it resets: "at its limit until it
 resets, route work elsewhere".
 
@@ -397,7 +398,8 @@ same.
   window), which the hub can route the pool's burn to. The banked line says "fill its account
   by then" with the rate those points need, and to redeem once the account is at its limit
   (`plan`: "a Claude hub account is at its limit"). A pool at its limit says to redeem only
-  once a reset's own account is full. The pool's own `lands on 100%` stays its rate to its
+  once a reset's own account is full, and to keep it while that account refills on its own
+  within `--redeem-margin` before the reset expires. The pool's own `lands on 100%` stays its rate to its
   reset. A pool's banked line says to redeem on the hub (the hub holds the logins;
   `/limit-reset` in a hub client's Claude Code does not reach them).
 - **Usage credits** are not read through the hub.

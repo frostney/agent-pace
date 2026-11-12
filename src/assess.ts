@@ -605,10 +605,16 @@ function bankPlan(
     // expire first: that one is redeemed)
     action = risky === null && !unlisted && leftH <= options.redeemMargin ? "wait" : "redeem";
     // a hub pool at its limit redeems a reset whose own account is full; until one is, the hub
-    // still has room on the others
+    // still has room on the others, and a full account that refills on its own within
+    // --redeem-margin, before its reset expires, would waste it
     const pooled = banked.credits.filter((c) => c.fill !== undefined);
-    if (action === "redeem" && pooled.length > 0 && !pooled.some((c) => (c.fill ?? 0) <= 0)) {
-      action = "fill";
+    const full = pooled.filter((c) => (c.fill ?? 0) <= 0);
+    const refillsSoon = (c: Credit) =>
+      c.ownerResetsAt !== undefined &&
+      c.ownerResetsAt - now <= options.redeemMargin * 3600 &&
+      (c.expiresAt === null || c.expiresAt > c.ownerResetsAt);
+    if (action === "redeem" && pooled.length > 0) {
+      action = full.length === 0 ? "fill" : full.every(refillsSoon) ? "wait" : "redeem";
     }
   } else if (risky !== null) {
     // the peak rate is at least the current one, so out of reach at the peak is out of reach now too
@@ -860,16 +866,21 @@ export function assess(
     const runningH = bank ? newH : leftH;
     const active = lanes ? lanes.active : 0;
     const lane = lanePlan(w, aim, runningH, newH, burn, active, roomChecks(w, aim, runningH, now));
-    // slow down never means stop: the lanes that fit every check to the reset, each at its share
-    // of the burn that set the status (so fewer than run now: that burn does not fit), never
-    // fewer than 1
+    // slow down never means stop: the lanes that fit every check to the reset, fewer than run now
+    // and never fewer than 1
     let laneKeep: number | null = null;
     if (status === "over") {
       laneKeep = 1;
       if (active > 1 && estimate !== null && estimate > 0 && leftH > 0.05) {
-        const each = estimate / active;
+        // this machine's lanes at their own burn where it is known; the rest of the burn (other
+        // machines on a hub's pool) is taken to go on whatever these lanes do
+        const local = burn !== null && burn.each > 0 ? burn : null;
+        const each = local ? local.each : estimate / active;
+        const elsewhere = local ? Math.max(0, estimate - local.total) : 0;
         const fit = Math.min(
-          ...roomChecks(w, aim, leftH, now).map(([h, room]) => Math.floor(room / (each * h))),
+          ...roomChecks(w, aim, leftH, now).map(([h, room]) =>
+            Math.floor((room - elsewhere * h) / (each * h)),
+          ),
         );
         laneKeep = Math.max(1, Math.min(active - 1, fit)); // fewer than run, whatever --target is
       }

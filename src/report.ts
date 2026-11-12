@@ -191,7 +191,12 @@ export function bankedLines(
     // a hub pool's reset that expires first only needs its own account filled, not the pool
     const account = b.accountShort !== undefined;
     const reach = account ? "fill its account" : "reach 100%";
-    if (b.action === "wait") {
+    if (b.action === "wait" && pooled) {
+      lines.push(
+        `at limit, but a full account refills on its own within ${floatRepr(b.redeemMarginH)}h: keep the banked reset ` +
+          `(${b.count} left, ${words.nextExpiry(b)})`,
+      );
+    } else if (b.action === "wait") {
       lines.push(
         `at limit, but the ${a.window} window resets on its own in ${formatFixed(a.hoursLeft, 1)}h: keep the banked reset ` +
           `(${b.count} left, ${words.nextExpiry(b)})`,
