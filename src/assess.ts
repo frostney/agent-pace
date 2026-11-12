@@ -108,6 +108,12 @@ export interface WindowAssessment extends LanePlan {
   /** On the binding window: what the usage credits support; null elsewhere and without credits. */
   credits: CreditPlan | null;
   /**
+   * A window that says slow down: the lanes to keep running to its reset, never fewer than 1
+   * (pacing slows work, it never stops it). Null on other windows, and while the per-lane burn
+   * is not known.
+   */
+  readonly laneKeep: number | null;
+  /**
    * A hub pool's window: [hours from now, points] each account resetting before it hands back.
    * Null otherwise. Not in --json.
    */
@@ -801,6 +807,12 @@ export function assess(
       lanes ? lanes.active : 0,
       returnedBy(w, now + runningH * 3600),
     );
+    // slow down never means stop: the lanes the window can keep to its reset, at least 1
+    let laneKeep: number | null = null;
+    if (status === "over" && burn !== null && burn.each > 0 && leftH > 0.05) {
+      const supported = Math.floor((aim - w.used + back) / (burn.each * leftH));
+      laneKeep = Math.max(1, Math.min(Math.max(lanes ? lanes.active : 0, 1), supported));
+    }
     if (redeeming(bank)) {
       // redeem first: the lanes the window takes afterwards are another question
       lane.perLaneRate = null;
@@ -841,6 +853,7 @@ export function assess(
       tokenCost,
       credits: null,
       returns,
+      laneKeep,
     });
     if (farBelow(w, aim, runningH, now, returnedBy(w, now + runningH * 3600))) {
       roomy.add(w.name);

@@ -5,6 +5,8 @@
 // Each case is one the Python version answered with "start nothing new" or "slow down".
 
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import type { WindowAssessment } from "../src/assess.ts";
+import { lanePhrase } from "../src/report.ts";
 import { Case, CREDITS, every, type Fields, iso, NOW, RESET, response } from "./harness.ts";
 
 setDefaultTimeout(30_000);
@@ -128,5 +130,41 @@ describe("LaneHours", () => {
     c.claude.seven_day = { utilization: 88, resets_at: iso(Math.trunc(NOW + 62.9 * 3600)) };
     const week = windows(await c.json("claude"))[1] as Fields;
     expect([week.rate_basis, week.status, week.lane_headroom]).toEqual(["window-average", "over", 0]);
+  });
+});
+
+// Pacing slows work, it never stops it: "slow down" and "no lane headroom" say how many lanes to
+// keep, never none, where the Python version said only "slow down" or "start nothing new".
+describe("NeverStop", () => {
+  test("slow down keeps the lanes that fit to the reset", async () => {
+    // four lanes at 0.2%/h each; 77 points to 97% over 139.8h fit floor(77 / (0.2 * 139.8)) = 2
+    codexBurn(20, 0.8, 4, []);
+    const w = windows(await c.json("codex"))[0] as Fields;
+    expect([w.status, w.lane_keep]).toEqual(["over", 2]);
+    expect(await c.codex()).toContain("-> slow down: keep 2 lanes running, start nothing new\n");
+  });
+
+  test("slow down without a per-lane burn still keeps a lane", async () => {
+    c.serve(response({ used: 70, credits: [] }));
+    const out = await c.codex();
+    expect(out).toContain("-> slow down: run fewer lanes, at least 1, start nothing new\n");
+    expect((windows(await c.json("codex"))[0] as Fields).lane_keep).toBeNull();
+  });
+
+  test("no lane headroom keeps the lanes running, or one when none is", () => {
+    const binding = {
+      laneBinding: true,
+      laneHeadroom: 0,
+      perLaneRate: null,
+      window: "7d",
+      laneHours: null,
+      used: 50,
+      banked: null,
+      credits: null,
+    };
+    const phrase = (active: number) =>
+      lanePhrase([{ ...binding, activeLanes: active } as unknown as WindowAssessment]);
+    expect(phrase(3)).toBe("no lane headroom: start nothing new, keep the 3 lanes running");
+    expect(phrase(0)).toBe("no lane headroom: start nothing new, but keep 1 lane running");
   });
 });

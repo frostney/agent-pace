@@ -107,7 +107,15 @@ the 5h target), a weekly or full grant the 7d window.
 
 "room left: add work" does not mean start as many agent lanes as you like. Every reading says
 how many more lanes the headroom supports (and "no lane headroom: start nothing new" at 0, even
-where the window has room):
+where the window has room).
+
+Pacing slows work; it never stops it. At 0 the advice keeps the lanes running ("no lane
+headroom: start nothing new, keep the 3 lanes running"), or one when none is ("... but keep 1
+lane running"). "slow down" says how many lanes fit to the window's reset at their per-lane
+burn, never fewer than 1 ("slow down: keep 2 lanes running, start nothing new"), or, without a
+per-lane burn yet, "slow down: run fewer lanes, at least 1, start nothing new". Only a window
+at its limit with nothing banked and no usage credits cannot run a lane until it resets, and
+says to route work elsewhere.
 - **Lanes active:** Claude Code session and subagent files under `$CLAUDE_CONFIG_DIR/projects`
   (default `~/.claude/projects`) whose last assistant message is under 10 minutes old; Codex
   rollout files under `$CODEX_HOME/sessions` written in the last 10 minutes. Only mtimes and one
@@ -162,8 +170,9 @@ where the window has room):
   reset has no room either.
 
 `--json` adds `active_lanes`, `per_lane_rate`, `lane_headroom`, `lane_hours` (the hours a new
-lane was given) and `lane_binding` (the window whose headroom the source reports) to each
-window, and a `lanes` summary with the same `hours` and the `pool` the lanes draw on: `plan`,
+lane was given), `lane_keep` (on a window that says slow down, the lanes to keep running, at
+least 1; null elsewhere or without a per-lane burn) and `lane_binding` (the window whose
+headroom the source reports) to each window, and a `lanes` summary with the same `hours` and the `pool` the lanes draw on: `plan`,
 or `usage-credits` once a window is at its limit (then its headroom and per-lane rate are the
 credits', in their unit; see [Usage credits](#usage-credits)). `rate_basis` is `lanes` when a
 week is paced by its running lanes' tokens, and `window_average_rate` gives the window's average burn beside
@@ -190,7 +199,8 @@ $ agent-pace claude
   credits. For Codex, the credit balance; unlimited credits have nothing that caps them.
 - **When they count:** only while a window is at 100% with no lane headroom, until the windows
   at their limit have reset. Below the limit, or with no credits left, the lanes read as
-  before ("no lane headroom: start nothing new").
+  before ("no lane headroom: start nothing new, at its limit until it resets: route work
+  elsewhere").
 - **Draw:** agent-pace records what the credits have spent at each reading
   (`<source>-credits.csv`) and measures their draw as it measures a window's recent burn: over
   the latest stretch of at least 9 minutes in which at least 3 units were spent, shared out
@@ -284,7 +294,8 @@ instead and paces their pool:
 
 ```console
 $ agent-pace claude
-12:25 claude pool (2 of 3 accounts): 5h 55% 12.0%/h 1.75h left, ends ~76% (25.7%/h lands on 100.0%) -> no lane headroom: start nothing new | 7d 65% 0.8%/h (window avg) 84.0h left, runs out in ~43.8h (0.4%/h lands on 100.0%) -> slow down
+12:25 claude pool (2 of 3 accounts): 5h 55% 12.0%/h 1.75h left, ends ~51% (40.0%/h lands on 100.0%) -> room left: add work (measuring: start at most 1-2 new lanes) | 7d 65% 0.8%/h (window avg) 84.0h left, runs out in ~43.8h (0.7%/h lands on 100%) -> keep going
+banked 7d reset expires Fri 24 Oct 12:25 (in 48.0h): fill to 100% by then (needs 0.7%/h, now 0.8%/h), then redeem it on the hub
   work (weight 3): 5h 40% resets Wed 22 Oct 14:25 (in 2.0h) | 7d 60% resets Sat 25 Oct 12:25 (in 72.0h); 1 banked, next expires Fri 24 Oct 12:25
   claude 2: 5h 100% resets Wed 22 Oct 13:25 (in 1.0h) | 7d 80% resets Mon 27 Oct 11:25 (in 120.0h); cooling down on the hub
   claude 3: disabled on the hub, not in the pool

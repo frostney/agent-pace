@@ -40,10 +40,30 @@ export function lanePhrase(res: readonly WindowAssessment[]): string {
     return `${lead}measuring: start at most 1-2 new lanes`;
   }
   if (more === 0) {
-    return `${lead}no lane headroom: start nothing new`;
+    // no room for another lane is no reason to stop the ones running, or the last one; only a
+    // plan at its limit (nothing banked, no credits) cannot run one until it resets
+    const binding = res.find((x) => x.laneBinding);
+    if (!paid && binding && binding.used >= 100 && !binding.banked) {
+      return "no lane headroom: start nothing new, at its limit until it resets: route work elsewhere";
+    }
+    const active = res[0]?.activeLanes ?? 0;
+    return active > 0
+      ? `${lead}no lane headroom: start nothing new, keep the ${active} lane${active > 1 ? "s" : ""} running`
+      : `${lead}no lane headroom: start nothing new, but keep 1 lane running`;
   }
   const rate = per === null ? "None" : paid ? `${creditAmount(per, paid)}/h` : `${floatRepr(per)}%/h`;
   return `${lead}room for ~${more} more lane${more > 1 ? "s" : ""} at ${rate} each${hours === null ? "" : ` for ${floatRepr(hours)}h`}`;
+}
+
+/** What slow down asks: fewer lanes, never none (pacing slows work, it never stops it). */
+function slowDown(a: WindowAssessment): string {
+  if (a.used >= 100) {
+    return "slow down: at its limit until it resets, route work elsewhere";
+  }
+  if (a.laneKeep === null) {
+    return "slow down: run fewer lanes, at least 1, start nothing new";
+  }
+  return `slow down: keep ${a.laneKeep} lane${a.laneKeep > 1 ? "s" : ""} running, start nothing new`;
 }
 
 const ADVICE: Record<Status, string> = {
@@ -92,7 +112,7 @@ export function render(
     if (a.note) {
       s += ` [${a.note}]`;
     }
-    let advice = ADVICE[a.status];
+    let advice = a.status === "over" ? slowDown(a) : ADVICE[a.status];
     const more = laneSummary(res)[0];
     const phrase = lanePhrase(res);
     if (redeeming(a.banked)) {
@@ -304,6 +324,7 @@ export function windowJson(a: WindowAssessment): JsonObject {
     lane_basis: a.laneBasis,
     lane_rates: a.laneRates === null ? null : a.laneRates.map(float),
     lane_hours: float(a.laneHours),
+    lane_keep: a.laneKeep,
     token_cost:
       a.tokenCost === null
         ? null

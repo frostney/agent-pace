@@ -231,7 +231,7 @@ describe("UsageCredits", () => {
     expect(line).toBe(
       "Claude 7d at 100% and Codex 7d at 100%: neither plan has room; route work to Claude on usage credits " +
         "(429.39 GBP left), or wait for a reset (lanes: Claude on usage credits (429.39 GBP left): room for ~2 more " +
-        "lanes at 30.00 GBP/h each for 1.0h; Codex no lane headroom: start nothing new)",
+        "lanes at 30.00 GBP/h each for 1.0h; Codex no lane headroom: start nothing new, at its limit until it resets: route work elsewhere)",
     );
     const data = JSON.parse((await c.runPace("plan", "--json"))[0]);
     expect(data.route).toBe("claude");
@@ -285,7 +285,7 @@ describe("UsageCredits", () => {
     c.serve(snapshot);
     c.codexLanes(2);
     const out = await c.codex();
-    expect(out).toContain("-> slow down\n");
+    expect(out).toContain("-> slow down: at its limit until it resets, route work elsewhere\n");
     expect(out).not.toContain("usage credits");
     const data = await c.json("codex");
     expect([(data.lanes as Fields).headroom, (data.lanes as Fields).pool, data.usage_credits]).toEqual([
