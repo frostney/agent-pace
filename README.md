@@ -391,12 +391,14 @@ same.
   plan limits. The pool's `banked_resets` lists them all (`via: "hub"`; unknown when the
   accounts read have none and another account's cannot be read), and each account's line lists
   its own. As on one login, a reset is at risk when it expires before the window it clears
-  resets, here its own account's window; then only that account has to be filled first,
+  resets, here its own account's window (always, while the account has not started it); then
+  only that account has to be filled first,
   `c·(100 - u) / Σ c` points of the pool (all of it if the account has not started that
   window), which the hub can route the pool's burn to. The banked line says "fill its account
   by then" with the rate those points need, and to redeem once the account is at its limit
-  (`plan`: "a Claude hub account is at its limit"). The pool's own `lands on 100%` stays its
-  rate to its reset. A pool's banked line says to redeem on the hub (the hub holds the logins;
+  (`plan`: "a Claude hub account is at its limit"). A pool at its limit says to redeem only
+  once a reset's own account is full. The pool's own `lands on 100%` stays its rate to its
+  reset. A pool's banked line says to redeem on the hub (the hub holds the logins;
   `/limit-reset` in a hub client's Claude Code does not reach them).
 - **Usage credits** are not read through the hub.
 - **Lanes** are counted on this machine, as without a hub. Other machines' lanes draw on the

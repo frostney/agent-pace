@@ -238,6 +238,51 @@ describe("PoolBankedResets", () => {
     expect([a?.banked?.mode, a?.banked?.action]).toEqual(["reset", "fill"]);
   });
 
+  test("a pooled reset on an account that has not started its window is always at risk", () => {
+    const idle = poolBanked({
+      url: "https://hub.test",
+      observedAt: NOW,
+      accounts: [
+        hubAccount("idle", [], ["1d"], {
+          count: 1,
+          credits: [{ expiresAt: NOW + 30 * H, title: null, clears: null }],
+        }),
+        hubAccount("busy", [day(50, 10)], ["1d"], { count: 0, credits: [] }),
+      ],
+    });
+    // it expires after the pool's reset in 10h, but the idle account has no reset of its own
+    const [a] = assess("claude-pool", [day(25, 10)], options, idle, null, NOW);
+    expect([a?.banked?.mode, a?.banked?.expiresInH]).toEqual(["expiry", 30]);
+  });
+
+  test("the expiry shown is the one at risk", () => {
+    // a reset expiring in 5h on an account that refills in 1h is safe; the one at risk expires in 8h
+    const two: Banked = {
+      count: 2,
+      credits: [
+        { expiresAt: NOW + 5 * H, title: null, clears: null, fill: 0, ownerResetsAt: NOW + H },
+        { expiresAt: NOW + 8 * H, title: null, clears: null, fill: 10, ownerResetsAt: NOW + 48 * H },
+      ],
+    };
+    const [a] = assess("claude-pool", [day(50, 10)], options, two, null, NOW);
+    expect([a?.banked?.mode, a?.banked?.expiresInH, a?.banked?.hoursToDeadline]).toEqual(["expiry", 8, 6]);
+  });
+
+  test("a pool at its limit redeems a reset only once its own account is full", () => {
+    // the pool at 98% with --target 97; the reset outlasts its account's reset, which has 10 points left
+    options = { ...options, target: 97 };
+    const room = (fill: number): Banked => ({
+      count: 1,
+      credits: [{ expiresAt: NOW + 48 * H, title: null, clears: null, fill, ownerResetsAt: NOW + 20 * H }],
+    });
+    expect(assess("claude-pool", [day(98, 10)], options, room(10), null, NOW)[0]?.banked?.action).toBe(
+      "fill",
+    );
+    expect(assess("claude-pool", [day(98, 10)], options, room(0), null, NOW)[0]?.banked?.action).toBe(
+      "redeem",
+    );
+  });
+
   test("a pool near its limit redeems a pooled reset only once its account is full", () => {
     // the pool at 98% with --target 97, but the reset's account still has 2 points to fill
     options = { ...options, target: 97 };

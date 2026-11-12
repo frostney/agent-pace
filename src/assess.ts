@@ -604,13 +604,20 @@ function bankPlan(
     // resets on its own soon would waste the reset (a reset whose expiry is not reported might
     // expire first: that one is redeemed)
     action = risky === null && !unlisted && leftH <= options.redeemMargin ? "wait" : "redeem";
+    // a hub pool at its limit redeems a reset whose own account is full; until one is, the hub
+    // still has room on the others
+    const pooled = banked.credits.filter((c) => c.fill !== undefined);
+    if (action === "redeem" && pooled.length > 0 && !pooled.some((c) => (c.fill ?? 0) <= 0)) {
+      action = "fill";
+    }
   } else if (risky !== null) {
     // the peak rate is at least the current one, so out of reach at the peak is out of reach now too
     if (horizon <= 0.05 || (peak !== null && used - back + peak * horizon < 100)) {
       action = "redeem-anyway";
     }
   }
-  const next = known[0] ?? null;
+  // the reset the advice is about: the one at risk, else the next to expire
+  const next = risky ?? known[0] ?? null;
   return {
     mode: risky !== null ? "expiry" : "reset",
     action,

@@ -477,7 +477,8 @@ export function poolBanked(pool: HubPool): Banked | null {
     }
     const own = a.windows.find((w) => w.name === longest);
     const fill = (capacity(a) * (100 - (own?.used ?? 0))) / total(longest);
-    return own === undefined ? { ...credit, fill } : { ...credit, fill, ownerResetsAt: own.resetsAt };
+    // a window it has not started has no reset of its own: a reset expiring is always at risk
+    return { ...credit, fill, ownerResetsAt: own === undefined ? Number.POSITIVE_INFINITY : own.resetsAt };
   };
   return {
     count,
