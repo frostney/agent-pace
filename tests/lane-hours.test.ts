@@ -173,5 +173,10 @@ describe("NeverStop", () => {
       lanePhrase([{ ...binding, activeLanes: active } as unknown as WindowAssessment]);
     expect(phrase(3)).toBe("no lane headroom: start nothing new, keep the 3 lanes running");
     expect(phrase(0)).toBe("no lane headroom: start nothing new, but keep 1 lane running");
+    // at its limit, keeping the banked reset because it resets on its own soon: no lane can run
+    const waiting = { ...binding, used: 100, banked: { action: "wait" }, activeLanes: 3 };
+    expect(lanePhrase([waiting as unknown as WindowAssessment])).toBe(
+      "no lane headroom: at its limit until it resets, route work elsewhere",
+    );
   });
 });

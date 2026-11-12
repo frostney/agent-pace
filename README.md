@@ -390,9 +390,10 @@ same.
   an account and the hub serves from it again. The pool's `banked_resets` lists them all
   (`via: "hub"`), and each account's line lists its own. A reset that expires before the pool's
   window resets only needs its own account filled first, `c·(100 - u) / Σ c` points of the
-  pool (all of it if the account has not started that window), which the hub can route the
-  pool's burn to: the banked line says "fill its account by then" with the rate those points
-  need, and to redeem at once when the account is already at its limit. The pool's own `lands
+  pool (all of it if the account has not started that window, or if that window resets on its
+  own before the reset expires), which the hub can route the pool's burn to: the banked line
+  says "fill its account by then" with the rate those points need, and to redeem at once when
+  the account is at its limit (`plan`: "a Claude hub account is at its limit"). The pool's own `lands
   on 100%` stays its rate to its reset. A pool's banked line says to redeem on the hub (the hub
   holds the logins; `/limit-reset` in a hub client's Claude Code does not reach them).
 - **Usage credits** are not read through the hub.

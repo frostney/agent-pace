@@ -451,7 +451,8 @@ export function poolBanked(pool: HubPool): Banked | null {
     }
   }
   // the account's room in the longest window the reset clears that its plan limits; a window it
-  // has not started is all room
+  // has not started is all room, and so is one that resets on its own before the reset expires
+  // (it refills, and its next window is what has to be full first)
   const fill = (a: HubAccount, c: Credit): number | undefined => {
     let longest: string | null = null;
     for (const [name, length] of lengths) {
@@ -463,7 +464,9 @@ export function poolBanked(pool: HubPool): Banked | null {
     if (longest === null) {
       return undefined;
     }
-    const used = a.windows.find((w) => w.name === longest)?.used ?? 0;
+    const own = a.windows.find((w) => w.name === longest);
+    const refills = own !== undefined && c.expiresAt !== null && own.resetsAt < c.expiresAt;
+    const used = own === undefined || refills ? 0 : own.used;
     return (capacity(a) * (100 - used)) / total(longest);
   };
   return {

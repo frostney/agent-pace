@@ -847,7 +847,7 @@ export function assess(
         const fit = Math.min(
           ...roomChecks(w, aim, leftH, now).map(([h, room]) => Math.floor(room / (each * h))),
         );
-        laneKeep = Math.max(1, fit);
+        laneKeep = Math.max(1, Math.min(active - 1, fit)); // fewer than run, whatever --target is
       }
     }
     if (redeeming(bank)) {

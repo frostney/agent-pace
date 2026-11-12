@@ -86,7 +86,15 @@ export function recommend(
       if (b.action === "wait") {
         continue; // at its limit, resetting on its own soon: nothing to fill
       }
-      if (b.action === "redeem") {
+      if (b.action === "redeem" && b.accountShort !== undefined) {
+        // a hub pool's reset whose account is at its limit: the account is, not the provider
+        redeems.push([
+          soon,
+          source,
+          `a ${name} hub account is at its limit: ${redeem("its banked reset")} (${b.count} left, ${words.nextExpiry(b)}), ` +
+            `then route spare work to ${name}`,
+        ]);
+      } else if (b.action === "redeem") {
         redeems.push([
           soon,
           source,
