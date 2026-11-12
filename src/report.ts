@@ -39,10 +39,28 @@ export function lanePhrase(res: readonly WindowAssessment[]): string {
     return `${lead}measuring: start at most 1-2 new lanes`;
   }
   if (more === 0) {
-    return `${lead}no lane headroom: start nothing new`;
+    // no room for another lane is no reason to stop the ones running, or the last one; only a
+    // plan at its limit (nothing banked, no credits) cannot run one until it resets
+    const binding = res.find((x) => x.laneBinding);
+    if (!paid && binding && binding.used >= 100 && (!binding.banked || binding.banked.action === "wait")) {
+      return "no lane headroom: at its limit until it resets, route work elsewhere";
+    }
+    const active = res[0]?.activeLanes ?? 0;
+    return active > 0
+      ? `${lead}no lane headroom: start nothing new, keep the ${active} lane${active > 1 ? "s" : ""} running`
+      : `${lead}no lane headroom: start nothing new, but keep 1 lane running`;
   }
   const rate = per === null ? "None" : paid ? `${creditAmount(per, paid)}/h` : `${floatRepr(per)}%/h`;
   return `${lead}room for ~${more} more lane${more > 1 ? "s" : ""} at ${rate} each${hours === null ? "" : ` for ${floatRepr(hours)}h`}`;
+}
+
+/** What slow down asks: fewer lanes, never none (pacing slows work, it never stops it). */
+function slowDown(a: WindowAssessment): string {
+  if (a.used >= 100) {
+    return "slow down: at its limit until it resets, route work elsewhere";
+  }
+  const keep = a.laneKeep ?? 1;
+  return `slow down: keep ${keep} lane${keep > 1 ? "s" : ""} running, start nothing new`;
 }
 
 const ADVICE: Record<Status, string> = {
@@ -74,10 +92,11 @@ export function render(
     }
     const rate = a.ratePerHour === null ? "?" : `${floatRepr(a.ratePerHour)}%/h${note}`;
     let s = `${a.window} ${formatFixed(a.used, 0)}% ${rate} ${floatRepr(a.hoursLeft)}h left`;
-    if (a.projectedAtReset !== null && a.projectedAtReset <= 100) {
+    // a pool's accounts that reset first hand back what they used, but it can run dry before they do
+    if (a.projectedAtReset !== null && a.projectedAtReset <= 100 && a.dryHours === null) {
       s += `, ends ~${a.projectedAtReset}%`;
     } else if (a.projectedAtReset !== null && a.ratePerHour) {
-      const h = (100 - a.used) / a.ratePerHour;
+      const h = a.dryHours ?? (100 - a.used) / a.ratePerHour;
       s += h < 48 ? `, runs out in ~${formatFixed(h, 1)}h` : `, runs out in ~${formatFixed(h / 24, 1)}d`;
     }
     if (a.target !== null && a.rateNeededForTarget !== null) {
@@ -89,7 +108,7 @@ export function render(
     if (a.note) {
       s += ` [${a.note}]`;
     }
-    let advice = ADVICE[a.status];
+    let advice = a.status === "over" ? slowDown(a) : ADVICE[a.status];
     const more = laneSummary(res)[0];
     const phrase = lanePhrase(res);
     if (redeeming(a.banked)) {
@@ -145,12 +164,22 @@ export class Wording {
   }
 }
 
-export function redeemIt(source: Source, what = "it"): string {
+/** How to redeem a banked reset; a hub pool's are redeemed on the hub, which holds the logins. */
+export function redeemIt(source: Source, what = "it", pooled = false): string {
+  if (pooled) {
+    return `redeem ${what} on the hub`;
+  }
   return source === "claude" ? "run /limit-reset in Claude Code" : `redeem ${what}`;
 }
 
 /** One line per window with banked resets: what to do with them. agent-pace never redeems one. */
-export function bankedLines(source: Source, res: readonly WindowAssessment[], words: Wording): string[] {
+export function bankedLines(
+  source: Source,
+  res: readonly WindowAssessment[],
+  words: Wording,
+  pooled = false,
+): string[] {
+  const redeem = (what = "it") => redeemIt(source, what, pooled);
   const lines: string[] = [];
   for (const a of res) {
     const b = a.banked;
@@ -159,37 +188,50 @@ export function bankedLines(source: Source, res: readonly WindowAssessment[], wo
     }
     const n = b.count > 1 ? ` [${b.count} banked]` : "";
     const which = res.length > 1 ? ` ${a.window}` : "";
-    if (b.action === "wait") {
+    // a hub pool's reset that expires first only needs its own account filled, not the pool
+    const account = b.accountShort !== undefined;
+    const reach = account ? "fill its account" : "reach 100%";
+    if (b.action === "wait" && pooled) {
+      lines.push(
+        `at limit, but a full account refills on its own within ${floatRepr(b.redeemMarginH)}h: keep the banked reset ` +
+          `(${b.count} left, ${words.nextExpiry(b)})`,
+      );
+    } else if (b.action === "wait") {
       lines.push(
         `at limit, but the ${a.window} window resets on its own in ${formatFixed(a.hoursLeft, 1)}h: keep the banked reset ` +
           `(${b.count} left, ${words.nextExpiry(b)})`,
       );
+    } else if (b.action === "redeem" && account) {
+      lines.push(
+        `banked${which} reset expires ${words.local(b.expiresAt)}, its account is at its limit: ` +
+          `${redeem()} (${b.count} left)`,
+      );
     } else if (b.action === "redeem") {
       const windowNote = which ? `, ${a.window} window` : "";
       lines.push(
-        `at limit: ${redeemIt(source, "a banked reset")} (${b.count} left${windowNote}, ${words.nextExpiry(b)})`,
+        `at limit: ${redeem("a banked reset")} (${b.count} left${windowNote}, ${words.nextExpiry(b)})`,
       );
     } else if (b.mode === "expiry") {
       const head = `banked${which} reset expires ${words.local(b.expiresAt)} (in ${formatFixed(b.expiresInH ?? 0, 1)}h)`;
       if (tooLateToFill(b)) {
         lines.push(
-          `${head}: too close to reach 100% (at ${formatFixed(a.used, 0)}%); ${redeemIt(source)} now, an unused reset is lost${n}`,
+          `${head}: too close to ${account ? reach : `${reach} (at ${formatFixed(a.used, 0)}%)`}; ${redeem()} now, an unused reset is lost${n}`,
         );
       } else if (b.action === "redeem-anyway") {
         lines.push(
-          `${head}: cannot reach 100% by then (needs ${perHour(b.rateNeeded)}, peak seen ${perHour(b.peakRate)}); ` +
-            `${redeemIt(source)} anyway by ${words.local(b.deadline)}, an unused reset is lost${n}`,
+          `${head}: cannot ${reach} by then (needs ${perHour(b.rateNeeded)}, peak seen ${perHour(b.peakRate)}); ` +
+            `${redeem()} anyway by ${words.local(b.deadline)}, an unused reset is lost${n}`,
         );
       } else {
         lines.push(
-          `${head}: fill to 100% by then (needs ${perHour(b.rateNeeded)}, now ${perHour(b.rateNow)}), then ${redeemIt(source)}${n}`,
+          `${head}: ${account ? reach : "fill to 100%"} by then (needs ${perHour(b.rateNeeded)}, now ${perHour(b.rateNow)}), then ${redeem()}${n}`,
         );
       }
     } else {
       lines.push(
         `${b.count} banked${which} reset${b.count > 1 ? "s" : ""}, none expiring before the ${a.window} window resets ` +
           `(${words.nextExpiry(b)}): fill to 100% by the reset (needs ${perHour(b.rateNeeded)}, now ${perHour(b.rateNow)}), ` +
-          `then ${redeemIt(source, "one")}`,
+          `then ${redeem("one")}`,
       );
     }
   }
@@ -291,6 +333,7 @@ export function windowJson(a: WindowAssessment): JsonObject {
     lane_basis: a.laneBasis,
     lane_rates: a.laneRates === null ? null : a.laneRates.map(float),
     lane_hours: float(a.laneHours),
+    lane_keep: a.laneKeep,
     token_cost:
       a.tokenCost === null
         ? null
@@ -397,10 +440,13 @@ export function readingName(source: Source, reading: ReadingWithLanes): string {
 export function noteLines(
   source: Source,
   res: readonly WindowAssessment[],
-  reading: Reading,
+  reading: ReadingWithLanes,
   words: Wording,
 ): string[] {
-  return [...bankedLines(source, res, words), ...(reading.note ? [reading.note] : [])];
+  return [
+    ...bankedLines(source, res, words, reading.pool !== undefined),
+    ...(reading.note ? [reading.note] : []),
+  ];
 }
 
 /** One message per window that rolled over since the last reading, each said once. */

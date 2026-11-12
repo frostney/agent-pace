@@ -5,6 +5,8 @@
 // Each case is one the Python version answered with "start nothing new" or "slow down".
 
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import type { WindowAssessment } from "../src/assess.ts";
+import { lanePhrase } from "../src/report.ts";
 import { Case, CREDITS, every, type Fields, iso, NOW, RESET, response } from "./harness.ts";
 
 setDefaultTimeout(30_000);
@@ -128,5 +130,53 @@ describe("LaneHours", () => {
     c.claude.seven_day = { utilization: 88, resets_at: iso(Math.trunc(NOW + 62.9 * 3600)) };
     const week = windows(await c.json("claude"))[1] as Fields;
     expect([week.rate_basis, week.status, week.lane_headroom]).toEqual(["window-average", "over", 0]);
+  });
+});
+
+// Pacing slows work, it never stops it: "slow down" and "no lane headroom" say how many lanes to
+// keep, never none, where the Python version said only "slow down" or "start nothing new".
+describe("NeverStop", () => {
+  test("slow down keeps the lanes that fit to the reset at the burn that set it", async () => {
+    // the week's 20% over its first 28.2h is 0.71%/h, which ends it far past 97%: six lanes at
+    // 0.118%/h each, of which floor(77 / (0.118 * 139.8)) = 4 fit to the reset
+    codexBurn(20, 0.8, 6, []);
+    const w = windows(await c.json("codex"))[0] as Fields;
+    expect([w.status, w.lane_keep]).toEqual(["over", 4]);
+    expect(await c.codex()).toContain("-> slow down: keep 4 lanes running, start nothing new\n");
+  });
+
+  test("slow down keeps fewer lanes than run", async () => {
+    // four lanes at their own 0.2%/h each: 77 / (0.2 * 139.8) fits 2
+    codexBurn(20, 0.8, 4, []);
+    expect((windows(await c.json("codex"))[0] as Fields).lane_keep).toBe(2);
+  });
+
+  test("slow down with no lane running here keeps one", async () => {
+    // other machines burn it
+    c.serve(response({ used: 70, credits: [] }));
+    expect(await c.codex()).toContain("-> slow down: keep 1 lane running, start nothing new\n");
+    expect((windows(await c.json("codex"))[0] as Fields).lane_keep).toBe(1);
+  });
+
+  test("no lane headroom keeps the lanes running, or one when none is", () => {
+    const binding = {
+      laneBinding: true,
+      laneHeadroom: 0,
+      perLaneRate: null,
+      window: "7d",
+      laneHours: null,
+      used: 50,
+      banked: null,
+      credits: null,
+    };
+    const phrase = (active: number) =>
+      lanePhrase([{ ...binding, activeLanes: active } as unknown as WindowAssessment]);
+    expect(phrase(3)).toBe("no lane headroom: start nothing new, keep the 3 lanes running");
+    expect(phrase(0)).toBe("no lane headroom: start nothing new, but keep 1 lane running");
+    // at its limit, keeping the banked reset because it resets on its own soon: no lane can run
+    const waiting = { ...binding, used: 100, banked: { action: "wait" }, activeLanes: 3 };
+    expect(lanePhrase([waiting as unknown as WindowAssessment])).toBe(
+      "no lane headroom: at its limit until it resets, route work elsewhere",
+    );
   });
 });

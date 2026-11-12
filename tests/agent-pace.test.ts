@@ -891,11 +891,12 @@ describe("Lanes", () => {
     expect(first(await c.json("codex")).lane_headroom).toBeNull();
   });
 
-  test("an over window carries no lane advice", async () => {
+  test("an over window says how many lanes to keep, never none", async () => {
+    // Python said a bare "slow down" here. Two lanes at 1.25%/h each would end the week far past
+    // 97%, and none fits to the reset, but pacing slows work, it never stops it: keep 1
     codexBurn(70, 0.6, 2, { credits: [] });
     const out = await c.codex();
-    expect(out).toContain("-> slow down");
-    expect(out).not.toContain("lane");
+    expect(out).toContain("-> slow down: keep 1 lane running, start nothing new\n");
   });
 
   test("a file vanishing mid scan is skipped", () => {
@@ -907,7 +908,9 @@ describe("Lanes", () => {
   test("a waiting window has no lane headroom and says so", async () => {
     c.serve(response({ used: 98, reset: NOW + 3600 }));
     c.codexLanes(1);
-    expect(await c.codex()).toContain("-> keep going (no lane headroom: start nothing new)");
+    expect(await c.codex()).toContain(
+      "-> keep going (no lane headroom: start nothing new, keep the 1 lane running)",
+    );
     expect(first(await c.json("codex")).lane_headroom).toBe(0);
   });
 
@@ -1036,7 +1039,7 @@ describe("Lanes", () => {
     codexBurn(20, 6.0, 5); // five lanes burning 1.2%/h each: no room for more before the reset
     // each new lane counted until the reset (with a reset banked, an hour would leave room)
     expect(await c.planLine("--lane-hours", "168")).toContain(
-      " - but Codex has no lane headroom right now (lanes: Codex no lane headroom: start nothing new;",
+      " - but Codex has no lane headroom right now (lanes: Codex no lane headroom: start nothing new, keep the 5 lanes running;",
     );
   });
 

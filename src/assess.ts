@@ -42,6 +42,12 @@ export interface BankAdvice {
   readonly expiryUnlisted: number;
   readonly redeemMarginH: number;
   readonly projectedAtDeadline: number | null;
+  /**
+   * A hub pool's reset expiring first: whether its account stays short of full by the deadline
+   * at the rate now (null without a rate). Only that account has to be filled, and the hub can
+   * route the pool's burn to it. Undefined otherwise; not in --json.
+   */
+  readonly accountShort?: boolean | null;
 }
 
 export interface LanePlan {
@@ -101,6 +107,68 @@ export interface WindowAssessment extends LanePlan {
   readonly tokenCost: TokenCost | null;
   /** On the binding window: what the usage credits support; null elsewhere and without credits. */
   credits: CreditPlan | null;
+  /**
+   * A window that says slow down: the lanes to keep running to its reset, fewer than run now
+   * but never fewer than 1 (pacing slows work, it never stops it). Null on other windows.
+   */
+  readonly laneKeep: number | null;
+  /**
+   * A hub pool's window that runs dry before it resets, counting what its accounts hand back on
+   * the way: the hours until it does. Null otherwise. Not in --json.
+   */
+  readonly dryHours: number | null;
+}
+
+/** The points a hub pool's window gets back by `until` from accounts that reset first; 0 for any other window. */
+function returnedBy(w: UsageWindow, until: number): number {
+  return (w.returns ?? []).reduce((sum, [at, points]) => (at <= until ? sum + points : sum), 0);
+}
+
+/**
+ * The hours until a window at `used` that burns `rate` %/h is full, with the points handed
+ * back on the way ([hours from now, points], in order). Null without a burn.
+ */
+export function hoursToEmpty(
+  used: number,
+  rate: number | null,
+  returns: readonly (readonly [hours: number, points: number])[] | null,
+): number | null {
+  if (!rate || rate <= 0) {
+    return null;
+  }
+  let left = 100 - used;
+  let at = 0;
+  for (const [h, points] of returns ?? []) {
+    if (left - rate * (h - at) <= 0) {
+      break;
+    }
+    left += points - rate * (h - at);
+    at = h;
+  }
+  return at + left / rate;
+}
+
+/**
+ * Where lanes are checked against a window's room over the next horizonH hours: just before
+ * each point a hub pool's account hands back (room to 100%, without it yet), and at the end
+ * (room to the aim, with what came back by then). [hours from now, points of room]. Any other
+ * window has the one check at the end.
+ */
+function roomChecks(w: UsageWindow, aim: number, horizonH: number, now: number): [number, number][] {
+  const checks: [number, number][] = [];
+  let back = 0;
+  for (const [at, points] of w.returns ?? []) {
+    const h = (at - now) / 3600;
+    if (h > horizonH) {
+      break;
+    }
+    if (h > 0.05) {
+      checks.push([h, 100 - w.used + back]);
+    }
+    back += points;
+  }
+  checks.push([horizonH, aim - w.used + back]);
+  return checks;
 }
 
 const sameWindow = (rows: readonly HistoryRow[], w: UsageWindow) =>
@@ -384,6 +452,7 @@ function lanePlan(
   newH: number,
   burn: LaneBurn | null,
   active: number,
+  checks: readonly (readonly [number, number])[],
 ): LanePlan {
   const out: LanePlan = {
     activeLanes: active,
@@ -412,7 +481,16 @@ function lanePlan(
   }
   out.perLaneRate = roundTo(burn.each, 2);
   out.laneHours = roundTo(newH, 2);
-  out.laneHeadroom = Math.max(0, Math.floor((aim - w.used - burn.total * runningH) / (burn.each * newH)));
+  // a pool's accounts that reset meanwhile hand back what they used, but only when they reset:
+  // the lanes must fit the room at each check, running ones until runningH, new ones until newH
+  out.laneHeadroom = Math.max(
+    0,
+    Math.min(
+      ...checks.map(([h, room]) =>
+        Math.floor((room - burn.total * Math.min(h, runningH)) / (burn.each * Math.min(h, newH))),
+      ),
+    ),
+  );
   return out;
 }
 
@@ -483,7 +561,22 @@ function bankPlan(
     .filter((e): e is number => e !== null)
     .sort((a, b) => a - b);
   const unlisted = banked.unlisted; // expiry not reported
-  const risky = known.find((e) => e < w.resetsAt) ?? null;
+  // a reset is at risk when it expires before the window it clears resets: a hub pool's, before
+  // its own account's window does
+  let first: Credit | null = null;
+  for (const c of banked.credits) {
+    const at = c.expiresAt;
+    if (
+      at !== null &&
+      at < (c.ownerResetsAt ?? w.resetsAt) &&
+      (first === null || at < (first.expiresAt ?? at))
+    ) {
+      first = c;
+    }
+  }
+  const risky = first?.expiresAt ?? null;
+  // a hub pool's reset: only its own account has to be full by then (fill points of the pool)
+  const fill = first?.fill;
   let deadline: number | null;
   let horizon: number;
   if (risky !== null) {
@@ -493,20 +586,44 @@ function bankPlan(
     deadline = null;
     horizon = leftH;
   }
-  const needed = horizon > 0.05 ? (100 - used) / horizon : null;
+  // a pool's accounts that reset by then hand back what they used
+  const back = returnedBy(w, deadline ?? w.resetsAt);
+  const left = fill ?? 100 - used + back;
+  const needed = horizon > 0.05 ? left / horizon : null;
   let action: BankAction = "fill";
-  if (used >= Math.max(options.target, 100 - options.band)) {
+  if (fill !== undefined) {
+    // a hub pool's reset expiring first goes by its own account, not the pool: redeem it once the
+    // account is full, or anyway when the account cannot be filled in time
+    if (fill <= 0) {
+      action = "redeem";
+    } else if (horizon <= 0.05 || (peak !== null && peak * horizon < fill)) {
+      action = "redeem-anyway";
+    }
+  } else if (used >= Math.max(options.target, 100 - options.band)) {
     // at the limit, however low --target is set; with nothing about to expire, a window that
     // resets on its own soon would waste the reset (a reset whose expiry is not reported might
     // expire first: that one is redeemed)
     action = risky === null && !unlisted && leftH <= options.redeemMargin ? "wait" : "redeem";
+    // a hub pool at its limit redeems a reset whose own account is full; until one is, the hub
+    // still has room on the others, and a full account that refills on its own within
+    // --redeem-margin, before its reset expires, would waste it
+    const pooled = banked.credits.filter((c) => c.fill !== undefined);
+    const full = pooled.filter((c) => (c.fill ?? 0) <= 0);
+    const refillsSoon = (c: Credit) =>
+      c.ownerResetsAt !== undefined &&
+      c.ownerResetsAt - now <= options.redeemMargin * 3600 &&
+      (c.expiresAt === null || c.expiresAt > c.ownerResetsAt);
+    if (action === "redeem" && pooled.length > 0) {
+      action = full.length === 0 ? "fill" : full.every(refillsSoon) ? "wait" : "redeem";
+    }
   } else if (risky !== null) {
     // the peak rate is at least the current one, so out of reach at the peak is out of reach now too
-    if (horizon <= 0.05 || (peak !== null && used + peak * horizon < 100)) {
+    if (horizon <= 0.05 || (peak !== null && used - back + peak * horizon < 100)) {
       action = "redeem-anyway";
     }
   }
-  const next = known[0] ?? null;
+  // the reset the advice is about: the one at risk, else the next to expire
+  const next = risky ?? known[0] ?? null;
   return {
     mode: risky !== null ? "expiry" : "reset",
     action,
@@ -521,7 +638,8 @@ function bankPlan(
     creditsWithoutExpiry: banked.credits.filter((c) => c.expiresAt === null).length,
     expiryUnlisted: unlisted,
     redeemMarginH: options.redeemMargin,
-    projectedAtDeadline: rate === null ? null : roundToInt(used + rate * horizon),
+    projectedAtDeadline: rate === null ? null : roundToInt(used - back + rate * horizon),
+    ...(fill === undefined ? {} : { accountShort: rate === null ? null : rate * horizon < fill }),
   };
 }
 
@@ -679,9 +797,14 @@ export function assess(
     if (plan === "even" && long !== null && w === long) {
       target = null; // the long window is paced through the short window's cap
     }
-    const projected = estimate === null ? null : w.used + estimate * leftH;
+    // a pool's accounts that reset before it hand back what they used
+    const back = returnedBy(w, w.resetsAt);
+    const returns = w.returns ? w.returns.map(([at, points]) => [(at - now) / 3600, points] as const) : null;
+    const projected = estimate === null ? null : w.used - back + estimate * leftH;
+    // a pool can run dry before an account hands its window back, even if it ends below 100%
+    const dryH = returns ? hoursToEmpty(w.used, estimate, returns) : null;
     let goal = target === null ? null : targetValue(target);
-    let needed = goal !== null && leftH > 0.05 ? (goal - w.used) / leftH : null;
+    let needed = goal !== null && leftH > 0.05 ? (goal - w.used + back) / leftH : null;
     const bank = bankPlan(
       w,
       estimate,
@@ -696,7 +819,14 @@ export function assess(
       target = 100;
       note = null;
       goal = 100;
-      needed = bank.rateNeeded;
+      // a hub pool's expiring reset only asks its account to be full by then: the pool itself
+      // lands on 100% at its reset
+      needed =
+        bank.accountShort === undefined
+          ? bank.rateNeeded
+          : leftH > 0.05
+            ? (100 - w.used + back) / leftH
+            : null;
       ahead = bank.projectedAtDeadline;
     }
     let status: Status;
@@ -709,6 +839,8 @@ export function assess(
         status = "on-target";
       } else if (bank.action === "redeem-anyway") {
         status = "under";
+      } else if (bank.accountShort !== undefined) {
+        status = bank.accountShort === null ? "measuring" : bank.accountShort ? "under" : "on-target";
       } else if (ahead === null) {
         status = "measuring";
       } else {
@@ -717,7 +849,7 @@ export function assess(
     } else if (projected === null) {
       const bounded = basis === "upper-bound" && rate !== null;
       status = bounded && w.used + rate * leftH < goal - options.band ? "under" : "measuring";
-    } else if (projected > Math.min(100, goal + 3)) {
+    } else if (projected > Math.min(100, goal + 3) || (dryH !== null && dryH < leftH)) {
       status = "over";
     } else if (projected < goal - options.band) {
       status = "under";
@@ -732,7 +864,27 @@ export function assess(
     // redeemed then), so they too count only until the next reading
     const newH = Math.min(options.laneHours, leftH);
     const runningH = bank ? newH : leftH;
-    const lane = lanePlan(w, aim, runningH, newH, burn, lanes ? lanes.active : 0);
+    const active = lanes ? lanes.active : 0;
+    const lane = lanePlan(w, aim, runningH, newH, burn, active, roomChecks(w, aim, runningH, now));
+    // slow down never means stop: the lanes that fit every check to the reset, fewer than run now
+    // and never fewer than 1
+    let laneKeep: number | null = null;
+    if (status === "over") {
+      laneKeep = 1;
+      if (active > 1 && estimate !== null && estimate > 0 && leftH > 0.05) {
+        // this machine's lanes at their own burn where it is known; the rest of the burn (other
+        // machines on a hub's pool) is taken to go on whatever these lanes do
+        const local = burn !== null && burn.each > 0 ? burn : null;
+        const each = local ? local.each : estimate / active;
+        const elsewhere = local ? Math.max(0, estimate - local.total) : 0;
+        const fit = Math.min(
+          ...roomChecks(w, aim, leftH, now).map(([h, room]) =>
+            Math.floor((room - elsewhere * h) / (each * h)),
+          ),
+        );
+        laneKeep = Math.max(1, Math.min(active - 1, fit)); // fewer than run, whatever --target is
+      }
+    }
     if (redeeming(bank)) {
       // redeem first: the lanes the window takes afterwards are another question
       lane.perLaneRate = null;
@@ -743,7 +895,12 @@ export function assess(
     } else if (bank && bank.action === "wait") {
       lane.laneHeadroom = 0; // full until it resets on its own
       lane.laneHours = null;
-    } else if (lane.laneHeadroom === null && !bank && projected !== null && projected > 100) {
+    } else if (
+      lane.laneHeadroom === null &&
+      !bank &&
+      projected !== null &&
+      (projected > 100 || (dryH !== null && dryH < leftH))
+    ) {
       lane.laneHeadroom = 0; // no per-lane estimate yet, but already on pace to run out
     }
     out.push({
@@ -767,6 +924,8 @@ export function assess(
       observedAt: isoUtc(w.observedAt),
       tokenCost,
       credits: null,
+      laneKeep,
+      dryHours: dryH !== null && dryH < leftH ? dryH : null,
     });
     if (farBelow(w, aim, runningH, now)) {
       roomy.add(w.name);

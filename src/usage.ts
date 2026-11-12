@@ -11,6 +11,11 @@ export interface UsageWindow {
   readonly resetsAt: number;
   readonly lengthS: number;
   readonly observedAt: number;
+  /**
+   * A hub pool's window only: [when, points] for each account that resets before the pool's
+   * window does, handing back at least the points it has used (as points of the pool).
+   */
+  readonly returns?: readonly (readonly [at: number, points: number])[];
 }
 
 /** A banked reset. `clears` names the windows it refills; null for a Codex reset, which clears all. */
@@ -18,6 +23,17 @@ export interface Credit {
   readonly expiresAt: number | null;
   readonly title: Json;
   readonly clears: readonly string[] | null;
+  /**
+   * A hub pool's reset only: the points of the pool its account has left in the window the
+   * reset is spent on, which is all that has to be filled before it expires.
+   */
+  readonly fill?: number;
+  /**
+   * A hub pool's reset only: when its account's window resets on its own. A reset that expires
+   * after that is not at risk, as on one login; one that expires before it only needs its
+   * account filled. Infinite while the account has not started that window.
+   */
+  readonly ownerResetsAt?: number;
 }
 
 /** The banked resets on an account; `credits` is null when only the count is known. */
@@ -71,6 +87,8 @@ export interface HubAccount {
   /** The hub has stopped routing to it for now (a cooldown, often a limit reached). */
   readonly coolingDown: boolean;
   readonly windows: readonly UsageWindow[];
+  /** The windows its plan limits, started or not; null when the hub does not say (before 5.2). */
+  readonly limits: readonly string[] | null;
   /** Its banked resets; null when they cannot be known. */
   readonly banked: Banked | null;
 }
