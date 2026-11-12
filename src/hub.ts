@@ -443,15 +443,28 @@ export function poolBanked(pool: HubPool): Banked | null {
   }
   const total = (window: string) =>
     members.filter((a) => limitedBy(a, window)).reduce((sum, a) => sum + capacity(a), 0);
+  // the pool's windows and their lengths, from every account that runs them
+  const lengths = new Map<string, number>();
+  for (const a of members) {
+    for (const w of a.windows) {
+      lengths.set(w.name, Math.max(lengths.get(w.name) ?? 0, w.lengthS));
+    }
+  }
+  // the account's room in the longest window the reset clears that its plan limits; a window it
+  // has not started is all room
   const fill = (a: HubAccount, c: Credit): number | undefined => {
-    const cleared = a.windows.filter(
-      (w) => limitedBy(a, w.name) && (c.clears === null || c.clears.includes(w.name)),
-    );
-    const longest = cleared.reduce<UsageWindow | null>(
-      (x, w) => (x === null || w.lengthS > x.lengthS ? w : x),
-      null,
-    );
-    return longest === null ? undefined : (capacity(a) * (100 - longest.used)) / total(longest.name);
+    let longest: string | null = null;
+    for (const [name, length] of lengths) {
+      const cleared = limitedBy(a, name) && (c.clears === null || c.clears.includes(name));
+      if (cleared && (longest === null || length > (lengths.get(longest) ?? 0))) {
+        longest = name;
+      }
+    }
+    if (longest === null) {
+      return undefined;
+    }
+    const used = a.windows.find((w) => w.name === longest)?.used ?? 0;
+    return (capacity(a) * (100 - used)) / total(longest);
   };
   return {
     count: known.reduce((sum, a) => sum + (a.banked?.count ?? 0), 0),

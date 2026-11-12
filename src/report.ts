@@ -2,7 +2,6 @@ import {
   type BankAdvice,
   type CreditPlan,
   creditsOf,
-  hoursToEmpty,
   laneSummary,
   laneSupply,
   type RateBasis,
@@ -43,8 +42,8 @@ export function lanePhrase(res: readonly WindowAssessment[]): string {
     // no room for another lane is no reason to stop the ones running, or the last one; only a
     // plan at its limit (nothing banked, no credits) cannot run one until it resets
     const binding = res.find((x) => x.laneBinding);
-    if (!paid && binding && binding.used >= 100 && !binding.banked) {
-      return "no lane headroom: start nothing new, at its limit until it resets: route work elsewhere";
+    if (!paid && binding && binding.used >= 100 && (!binding.banked || binding.banked.action === "wait")) {
+      return "no lane headroom: at its limit until it resets, route work elsewhere";
     }
     const active = res[0]?.activeLanes ?? 0;
     return active > 0
@@ -60,10 +59,8 @@ function slowDown(a: WindowAssessment): string {
   if (a.used >= 100) {
     return "slow down: at its limit until it resets, route work elsewhere";
   }
-  if (a.laneKeep === null) {
-    return "slow down: run fewer lanes, at least 1, start nothing new";
-  }
-  return `slow down: keep ${a.laneKeep} lane${a.laneKeep > 1 ? "s" : ""} running, start nothing new`;
+  const keep = a.laneKeep ?? 1;
+  return `slow down: keep ${keep} lane${keep > 1 ? "s" : ""} running, start nothing new`;
 }
 
 const ADVICE: Record<Status, string> = {
@@ -96,11 +93,10 @@ export function render(
     const rate = a.ratePerHour === null ? "?" : `${floatRepr(a.ratePerHour)}%/h${note}`;
     let s = `${a.window} ${formatFixed(a.used, 0)}% ${rate} ${floatRepr(a.hoursLeft)}h left`;
     // a pool's accounts that reset first hand back what they used, but it can run dry before they do
-    const dry = a.returns ? hoursToEmpty(a.used, a.ratePerHour, a.returns) : null;
-    if (a.projectedAtReset !== null && a.projectedAtReset <= 100 && !(dry !== null && dry < a.hoursLeft)) {
+    if (a.projectedAtReset !== null && a.projectedAtReset <= 100 && a.dryHours === null) {
       s += `, ends ~${a.projectedAtReset}%`;
     } else if (a.projectedAtReset !== null && a.ratePerHour) {
-      const h = dry ?? (100 - a.used) / a.ratePerHour;
+      const h = a.dryHours ?? (100 - a.used) / a.ratePerHour;
       s += h < 48 ? `, runs out in ~${formatFixed(h, 1)}h` : `, runs out in ~${formatFixed(h / 24, 1)}d`;
     }
     if (a.target !== null && a.rateNeededForTarget !== null) {
@@ -192,10 +188,18 @@ export function bankedLines(
     }
     const n = b.count > 1 ? ` [${b.count} banked]` : "";
     const which = res.length > 1 ? ` ${a.window}` : "";
+    // a hub pool's reset that expires first only needs its own account filled, not the pool
+    const account = b.accountShort !== undefined;
+    const reach = account ? "fill its account" : "reach 100%";
     if (b.action === "wait") {
       lines.push(
         `at limit, but the ${a.window} window resets on its own in ${formatFixed(a.hoursLeft, 1)}h: keep the banked reset ` +
           `(${b.count} left, ${words.nextExpiry(b)})`,
+      );
+    } else if (b.action === "redeem" && account) {
+      lines.push(
+        `banked${which} reset expires ${words.local(b.expiresAt)}, its account is at its limit: ` +
+          `${redeem()} (${b.count} left)`,
       );
     } else if (b.action === "redeem") {
       const windowNote = which ? `, ${a.window} window` : "";
@@ -206,16 +210,16 @@ export function bankedLines(
       const head = `banked${which} reset expires ${words.local(b.expiresAt)} (in ${formatFixed(b.expiresInH ?? 0, 1)}h)`;
       if (tooLateToFill(b)) {
         lines.push(
-          `${head}: too close to reach 100% (at ${formatFixed(a.used, 0)}%); ${redeem()} now, an unused reset is lost${n}`,
+          `${head}: too close to ${account ? reach : `${reach} (at ${formatFixed(a.used, 0)}%)`}; ${redeem()} now, an unused reset is lost${n}`,
         );
       } else if (b.action === "redeem-anyway") {
         lines.push(
-          `${head}: cannot reach 100% by then (needs ${perHour(b.rateNeeded)}, peak seen ${perHour(b.peakRate)}); ` +
+          `${head}: cannot ${reach} by then (needs ${perHour(b.rateNeeded)}, peak seen ${perHour(b.peakRate)}); ` +
             `${redeem()} anyway by ${words.local(b.deadline)}, an unused reset is lost${n}`,
         );
       } else {
         lines.push(
-          `${head}: fill to 100% by then (needs ${perHour(b.rateNeeded)}, now ${perHour(b.rateNow)}), then ${redeem()}${n}`,
+          `${head}: ${account ? reach : "fill to 100%"} by then (needs ${perHour(b.rateNeeded)}, now ${perHour(b.rateNow)}), then ${redeem()}${n}`,
         );
       }
     } else {

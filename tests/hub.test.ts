@@ -707,8 +707,8 @@ describe("HubClient", () => {
       // the pool are all that has to be filled before that reset expires
       "12:25 claude pool (2 of 3 accounts): 5h 55% ? 1.75h left (40.0%/h lands on 100.0%) -> " +
         "measuring: start at most 1-2 new lanes | " +
-        "7d 65% 0.8%/h (window avg) 84.0h left, runs out in ~43.8h (0.7%/h lands on 100%) -> keep going\n" +
-        "banked 7d reset expires Fri 24 Oct 12:25 (in 48.0h): fill to 100% by then (needs 0.7%/h, now 0.8%/h), " +
+        "7d 65% 0.8%/h (window avg) 84.0h left, runs out in ~45.2h (1.0%/h lands on 100%) -> keep going\n" +
+        "banked 7d reset expires Fri 24 Oct 12:25 (in 48.0h): fill its account by then (needs 0.7%/h, now 0.8%/h), " +
         "then redeem it on the hub\n" +
         "  work (weight 3): 5h 40% resets Wed 22 Oct 14:25 (in 2.0h) | 7d 60% resets Sat 25 Oct 12:25 (in 72.0h); " +
         "1 banked, next expires Fri 24 Oct 12:25\n" +
@@ -736,7 +736,7 @@ describe("HubClient", () => {
     expect(err).toBe("");
     expect(out.split("\n").slice(1)).toEqual([
       // codex 1's 50% left is 16.67 points of the pool, out of reach at 0.5%/h in 22 hours
-      "banked 7d reset expires Thu 23 Oct 12:25 (in 24.0h): cannot reach 100% by then (needs 0.8%/h, peak seen 0.5%/h); " +
+      "banked 7d reset expires Thu 23 Oct 12:25 (in 24.0h): cannot fill its account by then (needs 0.8%/h, peak seen 0.5%/h); " +
         "redeem it on the hub anyway by Thu 23 Oct 10:25, an unused reset is lost",
       "  codex 1 (pro): 5h 30% resets Wed 22 Oct 13:25 (in 1.0h) | 7d 50% resets Fri 24 Oct 12:25 (in 48.0h); " +
         "1 banked, next expires Thu 23 Oct 12:25",

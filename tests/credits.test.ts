@@ -113,7 +113,7 @@ describe("UsageCredits", () => {
   test("a window at its limit with no credits reads as before", async () => {
     claudeAtLimit(null);
     const out = await c.claudeOut();
-    expect(out).toContain("no lane headroom: start nothing new");
+    expect(out).toContain("no lane headroom: at its limit until it resets, route work elsewhere");
     expect(out).not.toContain("usage credits");
     const data = await c.json("claude");
     expect([(data.lanes as Fields).headroom, (data.lanes as Fields).pool, data.usage_credits]).toEqual([
@@ -128,7 +128,7 @@ describe("UsageCredits", () => {
   test("credits that ran out read as no credits", async () => {
     claudeAtLimit({ ...EXTRA_USAGE, is_enabled: false, disabled_reason: "out_of_credits" });
     const out = await c.claudeOut();
-    expect(out).toContain("no lane headroom: start nothing new");
+    expect(out).toContain("no lane headroom: at its limit until it resets, route work elsewhere");
     expect(out).not.toContain("usage credits");
     expect((await c.json("claude")).usage_credits).toBeNull();
     expect(prepaidRequests()).toEqual([]);
@@ -137,14 +137,16 @@ describe("UsageCredits", () => {
   test("credits that are used up to the balance read as no credits", async () => {
     claudeAtLimit();
     c.prepaid = { ...PREPAID, amount: 0 };
-    expect(await c.claudeOut()).toContain("-> no lane headroom: start nothing new");
+    expect(await c.claudeOut()).toContain(
+      "-> no lane headroom: at its limit until it resets, route work elsewhere",
+    );
   });
 
   test("a balance that cannot be read leaves the credits unknown, and the reading as before", async () => {
     claudeAtLimit();
     c.prepaid = null; // 404
     const out = await c.claudeOut();
-    expect(out).toContain("no lane headroom: start nothing new");
+    expect(out).toContain("no lane headroom: at its limit until it resets, route work elsewhere");
     expect((await c.json("claude")).usage_credits).toBeNull();
   });
 
@@ -231,7 +233,7 @@ describe("UsageCredits", () => {
     expect(line).toBe(
       "Claude 7d at 100% and Codex 7d at 100%: neither plan has room; route work to Claude on usage credits " +
         "(429.39 GBP left), or wait for a reset (lanes: Claude on usage credits (429.39 GBP left): room for ~2 more " +
-        "lanes at 30.00 GBP/h each for 1.0h; Codex no lane headroom: start nothing new, at its limit until it resets: route work elsewhere)",
+        "lanes at 30.00 GBP/h each for 1.0h; Codex no lane headroom: at its limit until it resets, route work elsewhere)",
     );
     const data = JSON.parse((await c.runPace("plan", "--json"))[0]);
     expect(data.route).toBe("claude");

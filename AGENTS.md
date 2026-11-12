@@ -20,9 +20,9 @@
   `claude-banked.json`), the default `--target` of 100 and `--band` of 3 where the Python
   version had 97 and 7 (the aim, the alert band, and every number and status they set),
   "slow down" and "no lane headroom" saying how many lanes to keep, never none (the wording
-  after them and the `lane_keep` field), reading a CLIProxyAPI hub's pool on a machine that goes through one (the pool's line name,
-  the account lines, the `hub` field, `via: "hub"`, the `<source>-pool-<window>.csv` and
-  `<source>-pool-members` and `<source>-pool-hub` files and
+  after them and the `lane_keep` field), reading a CLIProxyAPI hub's pool on a machine that
+  goes through one (the pool's line name, the account lines, the `hub` field, `via: "hub"`,
+  the `<source>-pool-<window>.csv` and `<source>-pool-members` and `<source>-pool-hub` files and
   `agent-pace hub serve` with its help, errors and answer; on a machine without a hub nothing
   changes, and `hub` is dispatched before the source parser so the sources' help and usage
   errors stay as they were) and `tokens-<source>.json`, which the Python version

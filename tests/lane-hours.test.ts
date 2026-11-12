@@ -136,19 +136,26 @@ describe("LaneHours", () => {
 // Pacing slows work, it never stops it: "slow down" and "no lane headroom" say how many lanes to
 // keep, never none, where the Python version said only "slow down" or "start nothing new".
 describe("NeverStop", () => {
-  test("slow down keeps the lanes that fit to the reset", async () => {
-    // four lanes at 0.2%/h each; 77 points to 97% over 139.8h fit floor(77 / (0.2 * 139.8)) = 2
-    codexBurn(20, 0.8, 4, []);
+  test("slow down keeps the lanes that fit to the reset at the burn that set it", async () => {
+    // the week's 20% over its first 28.2h is 0.71%/h, which ends it far past 97%: six lanes at
+    // 0.118%/h each, of which floor(77 / (0.118 * 139.8)) = 4 fit to the reset
+    codexBurn(20, 0.8, 6, []);
     const w = windows(await c.json("codex"))[0] as Fields;
-    expect([w.status, w.lane_keep]).toEqual(["over", 2]);
-    expect(await c.codex()).toContain("-> slow down: keep 2 lanes running, start nothing new\n");
+    expect([w.status, w.lane_keep]).toEqual(["over", 4]);
+    expect(await c.codex()).toContain("-> slow down: keep 4 lanes running, start nothing new\n");
   });
 
-  test("slow down without a per-lane burn still keeps a lane", async () => {
+  test("slow down keeps fewer lanes than run", async () => {
+    // four lanes: 77 / (0.177 * 139.8) fits 3, one fewer than run
+    codexBurn(20, 0.8, 4, []);
+    expect((windows(await c.json("codex"))[0] as Fields).lane_keep).toBe(3);
+  });
+
+  test("slow down with no lane running here keeps one", async () => {
+    // other machines burn it
     c.serve(response({ used: 70, credits: [] }));
-    const out = await c.codex();
-    expect(out).toContain("-> slow down: run fewer lanes, at least 1, start nothing new\n");
-    expect((windows(await c.json("codex"))[0] as Fields).lane_keep).toBeNull();
+    expect(await c.codex()).toContain("-> slow down: keep 1 lane running, start nothing new\n");
+    expect((windows(await c.json("codex"))[0] as Fields).lane_keep).toBe(1);
   });
 
   test("no lane headroom keeps the lanes running, or one when none is", () => {
