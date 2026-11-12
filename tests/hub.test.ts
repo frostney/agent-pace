@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { constants } from "node:os";
 import { join } from "node:path";
+import { hoursToEmpty } from "../src/assess.ts";
 import { USAGE_URL } from "../src/claude.ts";
 import { main } from "../src/cli.ts";
 import { CODEX_RESET_CREDITS_URL, CODEX_USAGE_URL } from "../src/codex.ts";
@@ -701,8 +702,14 @@ describe("HubClient", () => {
     const [out, err] = await c.runPace("claude");
     expect(err).toBe("");
     expect(out).toBe(
-      "12:25 claude pool (2 of 3 accounts): 5h 55% ? 1.75h left (25.7%/h lands on 100.0%) -> measuring | " +
-        "7d 65% 0.8%/h (window avg) 84.0h left, runs out in ~43.8h (0.4%/h lands on 100.0%) -> slow down\n" +
+      // claude 2's 5h resets in an hour and hands back its 25 points of the pool; the 7d pool
+      // aims at 100% with no slow down, since work has a reset banked, and work's 30 points of
+      // the pool are all that has to be filled before that reset expires
+      "12:25 claude pool (2 of 3 accounts): 5h 55% ? 1.75h left (40.0%/h lands on 100.0%) -> " +
+        "measuring: start at most 1-2 new lanes | " +
+        "7d 65% 0.8%/h (window avg) 84.0h left, runs out in ~43.8h (0.7%/h lands on 100%) -> keep going\n" +
+        "banked 7d reset expires Fri 24 Oct 12:25 (in 48.0h): fill to 100% by then (needs 0.7%/h, now 0.8%/h), " +
+        "then redeem it on the hub\n" +
         "  work (weight 3): 5h 40% resets Wed 22 Oct 14:25 (in 2.0h) | 7d 60% resets Sat 25 Oct 12:25 (in 72.0h); " +
         "1 banked, next expires Fri 24 Oct 12:25\n" +
         "  claude 2: 5h 100% resets Wed 22 Oct 13:25 (in 1.0h) | 7d 80% resets Mon 27 Oct 11:25 (in 120.0h); " +
@@ -728,6 +735,9 @@ describe("HubClient", () => {
     const [out, err] = await c.runPace("codex");
     expect(err).toBe("");
     expect(out.split("\n").slice(1)).toEqual([
+      // codex 1's 50% left is 16.67 points of the pool, out of reach at 0.5%/h in 22 hours
+      "banked 7d reset expires Thu 23 Oct 12:25 (in 24.0h): cannot reach 100% by then (needs 0.8%/h, peak seen 0.5%/h); " +
+        "redeem it on the hub anyway by Thu 23 Oct 10:25, an unused reset is lost",
       "  codex 1 (pro): 5h 30% resets Wed 22 Oct 13:25 (in 1.0h) | 7d 50% resets Fri 24 Oct 12:25 (in 48.0h); " +
         "1 banked, next expires Thu 23 Oct 12:25",
       "  codex 2 (promax, weight 2): 5h 10% resets Wed 22 Oct 16:25 (in 4.0h) | 7d 20% resets Tue 28 Oct 11:25 (in 144.0h)",
@@ -746,7 +756,14 @@ describe("HubClient", () => {
       ["5h", 16.67, iso(NOW + (3600 + 2 * 4 * 3600) / 3).replace("Z", "+00:00"), null],
       ["7d", 30.0, iso(NOW + (2 * 86400 + 2 * 6 * 86400) / 3).replace("Z", "+00:00"), null],
     ]);
-    expect(out.banked_resets).toEqual({ known: false, count: null, credits: null, via: "hub", note: null });
+    // the accounts' banked resets are the pool's
+    expect(out.banked_resets).toEqual({
+      known: true,
+      count: 1,
+      credits: [{ expires_at: iso(NOW + 86400).replace("Z", "+00:00"), title: "Full reset", clears: null }],
+      via: "hub",
+      note: null,
+    });
     const hub = out.hub as Fields;
     expect([hub.url, hub.accounts_in_pool, hub.accounts_enabled, hub.pool_capacity]).toEqual([HUB, 2, 2, 3]);
     expect((hub.accounts as Fields[])[1]).toEqual({
@@ -772,10 +789,11 @@ describe("HubClient", () => {
     });
   });
 
-  test("the pool is paced by its own history: a pool burning fast slows down", async () => {
+  test("the pool is paced by its own history", async () => {
     connect();
     claudeClient();
-    // the pool's 5h at 43% an hour ago, 49% half an hour ago: 12%/h, to 55 + 12 * 1.75 = 76%
+    // the pool's 5h at 43% an hour ago, 49% half an hour ago: 12%/h, to 55 - 25 + 12 * 1.75 = 51%
+    // (claude 2 resets in an hour and hands back its 25 points)
     writeFileSync(
       join(c.state, "claude-pool-5h.csv"),
       `${NOW - 3600},43.0,${NOW + 6300}\r\n${NOW - 1800},49.0,${NOW + 6300}\r\n`,
@@ -783,7 +801,7 @@ describe("HubClient", () => {
     c.claudeLanes(2);
     const [out] = await c.runPace("claude");
     expect(out.split("\n")[0]).toStartWith(
-      "12:25 claude pool (2 of 3 accounts): 5h 55% 12.0%/h 1.75h left, ends ~76%",
+      "12:25 claude pool (2 of 3 accounts): 5h 55% 12.0%/h 1.75h left, ends ~51%",
     );
   });
 
@@ -798,6 +816,50 @@ describe("HubClient", () => {
     expect(((await c.json("claude")).windows as Fields[])[0]?.previous_window_ended_at).toBeNull();
   });
 
+  test("an account that resets before the pool hands its window back: the pool is not out early", async () => {
+    connect();
+    claudeClient();
+    const a1 = cliproxy.answers.a1 as Record<string, [number, Fields]>;
+    a1[USAGE_URL] = [200, { ...(a1[USAGE_URL] as [number, Fields])[1], cedar_ember: null }]; // nothing banked
+    cliproxy.answers.b2 = {
+      [USAGE_URL]: [
+        200,
+        {
+          five_hour: { utilization: 100, resets_at: iso(NOW + 3600) },
+          seven_day: { utilization: 80, resets_at: iso(NOW + 86400) },
+        },
+      ],
+    };
+    const [out] = await c.runPace("claude");
+    // the pool's 7d: 65% used, resetting in (3 * 72 + 24) / 4 = 60h at 65 / 108 = 0.6%/h; claude 2
+    // resets in 24h and hands back its 20 points, so it ends ~65 - 20 + 0.6 * 60 = 81%, not past 100%
+    expect(out.split("\n")[0]).toContain(" | 7d 65% 0.6%/h (window avg) 60.0h left, ends ~81% ");
+    expect(out).not.toContain("slow down");
+  });
+
+  test("a pool that runs dry before an account hands its window back is out", () => {
+    // 10 points left at 1%/h: dry in 10h, before 25 points come back at 20h
+    expect(hoursToEmpty(90, 1, [[20, 25]])).toBe(10);
+    // back at 5h, with 5 points still left: 5 + (5 + 25) / 1
+    expect(hoursToEmpty(90, 1, [[5, 25]])).toBe(35);
+    expect(hoursToEmpty(90, 1, null)).toBe(10);
+    expect(hoursToEmpty(90, null, [[5, 25]])).toBeNull();
+  });
+
+  test("an account whose plan has no 5-hour limit is not in the pool's 5h", async () => {
+    connect();
+    claudeClient();
+    cliproxy.answers.b2 = {
+      [USAGE_URL]: [
+        200,
+        { five_hour: null, seven_day: { utilization: 80, resets_at: iso(NOW + 5 * 86400) } },
+      ],
+    };
+    const [out] = await c.runPace("claude");
+    // work's 40% alone, not (3 * 40 + 1 * 0) / 4 = 30%
+    expect(out).toStartWith("12:25 claude pool (2 of 3 accounts): 5h 40% ");
+  });
+
   test("plan reads both pools", async () => {
     connect();
     claudeClient();
@@ -806,7 +868,8 @@ describe("HubClient", () => {
     expect(err).toBe("");
     const lines = out.split("\n");
     expect(lines[1]).toStartWith("  12:25 claude pool (2 of 3 accounts): ");
-    expect(lines[2]).toStartWith("    work (weight 3): 5h 40%");
+    expect(lines[2]).toEndWith("then redeem it on the hub");
+    expect(lines[3]).toStartWith("    work (weight 3): 5h 40%");
     expect(lines.find((l) => l.startsWith("  12:25 codex pool (2 accounts): "))).toBeDefined();
     expect(lines).toContain(
       "    codex 2 (promax, weight 2): 5h 10% resets Wed 22 Oct 16:25 (in 4.0h) | 7d 20% resets Tue 28 Oct 11:25 (in 144.0h)",

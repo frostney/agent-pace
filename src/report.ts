@@ -2,6 +2,7 @@ import {
   type BankAdvice,
   type CreditPlan,
   creditsOf,
+  hoursToEmpty,
   laneSummary,
   laneSupply,
   type RateBasis,
@@ -74,10 +75,12 @@ export function render(
     }
     const rate = a.ratePerHour === null ? "?" : `${floatRepr(a.ratePerHour)}%/h${note}`;
     let s = `${a.window} ${formatFixed(a.used, 0)}% ${rate} ${floatRepr(a.hoursLeft)}h left`;
-    if (a.projectedAtReset !== null && a.projectedAtReset <= 100) {
+    // a pool's accounts that reset first hand back what they used, but it can run dry before they do
+    const dry = a.returns ? hoursToEmpty(a.used, a.ratePerHour, a.returns) : null;
+    if (a.projectedAtReset !== null && a.projectedAtReset <= 100 && !(dry !== null && dry < a.hoursLeft)) {
       s += `, ends ~${a.projectedAtReset}%`;
     } else if (a.projectedAtReset !== null && a.ratePerHour) {
-      const h = (100 - a.used) / a.ratePerHour;
+      const h = dry ?? (100 - a.used) / a.ratePerHour;
       s += h < 48 ? `, runs out in ~${formatFixed(h, 1)}h` : `, runs out in ~${formatFixed(h / 24, 1)}d`;
     }
     if (a.target !== null && a.rateNeededForTarget !== null) {
@@ -145,12 +148,22 @@ export class Wording {
   }
 }
 
-export function redeemIt(source: Source, what = "it"): string {
+/** How to redeem a banked reset; a hub pool's are redeemed on the hub, which holds the logins. */
+export function redeemIt(source: Source, what = "it", pooled = false): string {
+  if (pooled) {
+    return `redeem ${what} on the hub`;
+  }
   return source === "claude" ? "run /limit-reset in Claude Code" : `redeem ${what}`;
 }
 
 /** One line per window with banked resets: what to do with them. agent-pace never redeems one. */
-export function bankedLines(source: Source, res: readonly WindowAssessment[], words: Wording): string[] {
+export function bankedLines(
+  source: Source,
+  res: readonly WindowAssessment[],
+  words: Wording,
+  pooled = false,
+): string[] {
+  const redeem = (what = "it") => redeemIt(source, what, pooled);
   const lines: string[] = [];
   for (const a of res) {
     const b = a.banked;
@@ -167,29 +180,29 @@ export function bankedLines(source: Source, res: readonly WindowAssessment[], wo
     } else if (b.action === "redeem") {
       const windowNote = which ? `, ${a.window} window` : "";
       lines.push(
-        `at limit: ${redeemIt(source, "a banked reset")} (${b.count} left${windowNote}, ${words.nextExpiry(b)})`,
+        `at limit: ${redeem("a banked reset")} (${b.count} left${windowNote}, ${words.nextExpiry(b)})`,
       );
     } else if (b.mode === "expiry") {
       const head = `banked${which} reset expires ${words.local(b.expiresAt)} (in ${formatFixed(b.expiresInH ?? 0, 1)}h)`;
       if (tooLateToFill(b)) {
         lines.push(
-          `${head}: too close to reach 100% (at ${formatFixed(a.used, 0)}%); ${redeemIt(source)} now, an unused reset is lost${n}`,
+          `${head}: too close to reach 100% (at ${formatFixed(a.used, 0)}%); ${redeem()} now, an unused reset is lost${n}`,
         );
       } else if (b.action === "redeem-anyway") {
         lines.push(
           `${head}: cannot reach 100% by then (needs ${perHour(b.rateNeeded)}, peak seen ${perHour(b.peakRate)}); ` +
-            `${redeemIt(source)} anyway by ${words.local(b.deadline)}, an unused reset is lost${n}`,
+            `${redeem()} anyway by ${words.local(b.deadline)}, an unused reset is lost${n}`,
         );
       } else {
         lines.push(
-          `${head}: fill to 100% by then (needs ${perHour(b.rateNeeded)}, now ${perHour(b.rateNow)}), then ${redeemIt(source)}${n}`,
+          `${head}: fill to 100% by then (needs ${perHour(b.rateNeeded)}, now ${perHour(b.rateNow)}), then ${redeem()}${n}`,
         );
       }
     } else {
       lines.push(
         `${b.count} banked${which} reset${b.count > 1 ? "s" : ""}, none expiring before the ${a.window} window resets ` +
           `(${words.nextExpiry(b)}): fill to 100% by the reset (needs ${perHour(b.rateNeeded)}, now ${perHour(b.rateNow)}), ` +
-          `then ${redeemIt(source, "one")}`,
+          `then ${redeem("one")}`,
       );
     }
   }
@@ -397,10 +410,13 @@ export function readingName(source: Source, reading: ReadingWithLanes): string {
 export function noteLines(
   source: Source,
   res: readonly WindowAssessment[],
-  reading: Reading,
+  reading: ReadingWithLanes,
   words: Wording,
 ): string[] {
-  return [...bankedLines(source, res, words), ...(reading.note ? [reading.note] : [])];
+  return [
+    ...bankedLines(source, res, words, reading.pool !== undefined),
+    ...(reading.note ? [reading.note] : []),
+  ];
 }
 
 /** One message per window that rolled over since the last reading, each said once. */

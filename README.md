@@ -331,10 +331,12 @@ times one plan's window holds another's, so give a bigger account a bigger weigh
 it (Codex) and its weight.
 
 For each window (5h and 7d for Claude, the windows Codex reports), over the accounts in the
-pool, with `c` an account's capacity, `u` its use of its own window in percent and `t` the
-time that window resets:
+pool whose plan limits that window, with `c` an account's capacity, `u` its use of its own
+window in percent and `t` the time that window resets:
 - **use** = Σ c·u / Σ c. An account without that window running (no Claude session in the last
-  five hours) counts as 0%.
+  five hours) counts as 0%. An account whose plan has no such limit (a Claude plan with no
+  session limit, as the hub's `limits` says from agent-pace 5.2) is not in that window's pool
+  at all; with a hub that does not say, every account counts in every window.
 - **reset** = Σ c·t / Σ c over the accounts with that window running; now plus the window's
   length if none has it running. The hours left are to that time.
 
@@ -347,6 +349,14 @@ So the pool's projection is the mean of where the accounts' windows end, the tar
 average they reach their limit before they reset. It is a mean: one account can reach its
 limit while the pool has room (the hub then routes around it, and its line says `cooling down
 on the hub`).
+
+An account whose window resets before the pool's mean reset hands that window back meanwhile.
+The projection counts what it has used now, `c·u / Σ c` points of the pool, as coming back at
+its reset (at least that much comes back; what it burns before then is not counted, so this
+errs towards running out). The rate needed to land on the target, the lane headroom and
+`runs out in` count it too. Because points come back only at those resets, the pool can run
+dry before one even when it would end below 100%: it then says `runs out in` and `slow down`
+all the same.
 - **In the pool:** the accounts the hub has enabled whose usage was read, with a capacity above
   0. A disabled account is not counted at all. An unreadable one is left out of both means, and
   the line says so ("2 of 3 accounts"); the room it has is then missing from the verdict. An
@@ -363,9 +373,15 @@ on the hub`).
   its weight changes, or an account starts or stops standing in with an older reading, the
   pool's use moves by more than anything burned: the pool's history starts over then (the accounts and shares of the last reading are kept in
   `<source>-pool-members`), and the rate is measured afresh.
-- **Banked resets** are listed on each account's line and in `--json`, and do not change the
-  pool's pacing: a reset refills one account, a share of the pool, and is redeemed for that
-  account. The pool's own `banked_resets` is unknown (`known: false`, `via: "hub"`).
+- **Banked resets** of the accounts in the pool are the pool's: with one banked, the pool is
+  paced as a window with a reset banked (see [Banked resets](#banked-resets)): it aims at 100%
+  with no `--reserve` taper and no `slow down`, because when the pool runs out a reset refills
+  an account and the hub serves from it again. The pool's `banked_resets` lists them all
+  (`via: "hub"`), and each account's line lists its own. A reset that expires before the pool's
+  window resets only needs its own account filled first, `c·(100 - u) / Σ c` points of the
+  pool, which the hub can route the pool's burn to; the rate it needs and whether it can still
+  be reached are of those points. A pool's banked line says to redeem on the hub (the hub holds
+  the logins; `/limit-reset` in a hub client's Claude Code does not reach them).
 - **Usage credits** are not read through the hub.
 - **Lanes** are counted on this machine, as without a hub. Other machines' lanes draw on the
   same pool: their use shows in the pool's rate but not in the lane count, so the per-lane burn

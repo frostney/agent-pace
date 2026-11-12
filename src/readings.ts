@@ -6,7 +6,7 @@ import { codexReading } from "./codex.ts";
 import { withLock } from "./file-lock.ts";
 import { CREDITS_LOG, logPath, read, record } from "./history.ts";
 import type { Host } from "./host.ts";
-import { hubLogin, hubReading, poolMembers, poolWindows } from "./hub.ts";
+import { hubLogin, hubReading, poolBanked, poolMembers, poolWindows } from "./hub.ts";
 import { laneReading } from "./lanes.ts";
 import { dumps, float, isRecord, type Json } from "./python-json.ts";
 import { tokenReading } from "./token-ledger.ts";
@@ -254,7 +254,7 @@ async function readPool(source: Source, pool: HubPool, state: string, host: Host
   }
   return {
     windows,
-    banked: null, // each account's own; the pool's pacing does not count on them
+    banked: poolBanked(pool), // a reset on any account refills the pool, as on one login
     note: null,
     via: "hub",
     credits: null,

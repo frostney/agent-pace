@@ -63,6 +63,7 @@ export function recommend(
   errors: Errors,
   reserve: number,
   words: Wording,
+  pooled: ReadonlySet<Source> = new Set(),
 ): [Source | "none", boolean, string] {
   const redeems: Reason[] = [];
   let pulls: Reason[] = [];
@@ -71,6 +72,7 @@ export function recommend(
   for (const source of read) {
     const res = readings[source] ?? [];
     const name = NAMES[source];
+    const redeem = (what = "it") => redeemIt(source, what, pooled.has(source));
     hot[source] = tight(res, reserve);
     for (const a of res) {
       const b = a.banked;
@@ -88,14 +90,14 @@ export function recommend(
         redeems.push([
           soon,
           source,
-          `${name} is at its limit: ${redeemIt(source, "a banked reset")} (${b.count} left, ${words.nextExpiry(b)}), ` +
+          `${name} is at its limit: ${redeem("a banked reset")} (${b.count} left, ${words.nextExpiry(b)}), ` +
             `then route spare work to ${name}`,
         ]);
       } else if (tooLateToFill(b)) {
         redeems.push([
           soon,
           source,
-          `${redeemIt(source)} now: a ${name} banked ${which}reset expires in ${expiresIn}h and ` +
+          `${redeem()} now: a ${name} banked ${which}reset expires in ${expiresIn}h and ` +
             `the window cannot be filled in time; then route spare work to ${name}`,
         ]);
       } else if (b.action === "redeem-anyway") {
@@ -104,7 +106,7 @@ export function recommend(
           soon,
           source,
           `banked ${which}reset expires in ${expiresIn}h and cannot be filled by then ` +
-            `(needs ${needs}, peak ${peak}); fill what you can, then ${redeemIt(source)}`,
+            `(needs ${needs}, peak ${peak}); fill what you can, then ${redeem()}`,
         ]);
       } else if (a.status !== "on-target" && b.mode === "expiry") {
         pulls.push([soon, source, `banked ${which}reset expires in ${expiresIn}h and needs ${needs}`]);
@@ -227,7 +229,8 @@ export async function runPlan(options: PaceOptions & { readonly json: boolean },
   }
   const readings: Readings = Object.fromEntries(read.map(({ source, res }) => [source, res]));
   const words = new Wording(host.timeZone);
-  let [route, redeem, text] = recommend(readings, errors, options.reserve, words);
+  const pooled = new Set(read.filter((r) => r.reading.pool).map((r) => r.source));
+  let [route, redeem, text] = recommend(readings, errors, options.reserve, words, pooled);
   const routed = read.find((r) => r.source === route);
   if (routed && !redeem) {
     // work is going somewhere: say how many lanes each provider can take

@@ -182,6 +182,8 @@ function parseAccount(value: unknown, observedAt: number): HubAccount {
   check(weight === null || (isPythonInt(weight) && typeof weight === "number"));
   check(readAt === null || numericValue(readAt) !== null);
   check(typeof get(value, "cooling_down") === "boolean" && Array.isArray(windows));
+  const limits = get(value, "limits"); // absent before agent-pace 5.2 on the hub
+  check(limits === null || (Array.isArray(limits) && limits.every((x) => typeof x === "string")));
   return {
     label: label as string,
     plan: stringOrNull(get(value, "plan")),
@@ -201,6 +203,7 @@ function parseAccount(value: unknown, observedAt: number): HubAccount {
         observedAt,
       };
     }),
+    limits: limits as string[] | null,
     banked: parseBanked(get(value, "banked")),
   };
 }
@@ -357,13 +360,22 @@ export function enabled(pool: HubPool): HubAccount[] {
   return pool.accounts.filter((a) => a.state !== "disabled");
 }
 
+/** Whether an account's plan limits this window; with no limits from the hub, every window. */
+function limitedBy(account: HubAccount, window: string): boolean {
+  return account.limits === null || account.limits.includes(window);
+}
+
 /**
  * The pool's windows: for each window name an account in the pool reports, the use is the
- * capacity-weighted mean of the accounts' use (an account without that window running counts
- * as 0%), and the reset is the capacity-weighted mean of the reset times of the accounts with
+ * capacity-weighted mean of the use of the accounts whose plan limits that window (one without
+ * that window running counts as 0%; one whose plan has no such limit is not in that window's
+ * pool), and the reset is the capacity-weighted mean of the reset times of the accounts with
  * it running (now plus the window's length when none has it running). With every account
  * burning the same share of its own capacity, that mean projected to that reset is the mean of
  * each account projected to its own reset, so the target and the verdict answer for the pool.
+ *
+ * An account that resets before that mean hands its window back meanwhile: `returns` holds
+ * when, and the points of the pool it has used now, which it hands back at least.
  */
 export function poolWindows(source: Source, pool: HubPool, now: number): UsageWindow[] {
   const members = pool.accounts.filter(inPool);
@@ -374,19 +386,22 @@ export function poolWindows(source: Source, pool: HubPool, now: number): UsageWi
   const lengths = new Map<string, number>();
   for (const a of members) {
     for (const w of a.windows) {
-      lengths.set(w.name, Math.max(lengths.get(w.name) ?? 0, w.lengthS));
+      if (limitedBy(a, w.name)) {
+        lengths.set(w.name, Math.max(lengths.get(w.name) ?? 0, w.lengthS));
+      }
     }
   }
   if (lengths.size === 0) {
     throw new NetworkError(`the hub's ${PROVIDER_NAMES[source]} accounts report no usage windows`);
   }
-  const total = members.reduce((sum, a) => sum + capacity(a), 0);
   const out: UsageWindow[] = [];
   for (const [name, lengthS] of lengths) {
+    const counted = members.filter((a) => limitedBy(a, name));
+    const total = counted.reduce((sum, a) => sum + capacity(a), 0);
     let used = 0;
     let resetWeight = 0;
     let resetSum = 0;
-    for (const a of members) {
+    for (const a of counted) {
       const w = a.windows.find((x) => x.name === name);
       if (w) {
         used += capacity(a) * w.used;
@@ -394,15 +409,60 @@ export function poolWindows(source: Source, pool: HubPool, now: number): UsageWi
         resetSum += capacity(a) * w.resetsAt;
       }
     }
+    const resetsAt = resetWeight > 0 ? resetSum / resetWeight : now + lengthS;
+    const returns: [number, number][] = [];
+    for (const a of counted) {
+      const w = a.windows.find((x) => x.name === name);
+      if (w && w.used > 0 && w.resetsAt > now && w.resetsAt < resetsAt) {
+        returns.push([w.resetsAt, (capacity(a) * w.used) / total]);
+      }
+    }
     out.push({
       name,
       used: roundTo(used / total, 2),
-      resetsAt: resetWeight > 0 ? resetSum / resetWeight : now + lengthS,
+      resetsAt,
       lengthS,
       observedAt: pool.observedAt,
+      ...(returns.length > 0 ? { returns: returns.sort((a, b) => a[0] - b[0]) } : {}),
     });
   }
   return out.sort((a, b) => a.lengthS - b.lengthS);
+}
+
+/**
+ * The pool's banked resets: those of the accounts in it, each still clearing its own windows.
+ * Null when no account's are known. A reset banked on any account means the pool may run out
+ * early and be refilled, as a reset banked on one login does. Before a reset expires only its
+ * own account has to be filled (`fill`, in points of the pool), not the whole pool.
+ */
+export function poolBanked(pool: HubPool): Banked | null {
+  const members = pool.accounts.filter(inPool);
+  const known = members.filter((a) => a.banked !== null);
+  if (known.length === 0) {
+    return null;
+  }
+  const total = (window: string) =>
+    members.filter((a) => limitedBy(a, window)).reduce((sum, a) => sum + capacity(a), 0);
+  const fill = (a: HubAccount, c: Credit): number | undefined => {
+    const cleared = a.windows.filter(
+      (w) => limitedBy(a, w.name) && (c.clears === null || c.clears.includes(w.name)),
+    );
+    const longest = cleared.reduce<UsageWindow | null>(
+      (x, w) => (x === null || w.lengthS > x.lengthS ? w : x),
+      null,
+    );
+    return longest === null ? undefined : (capacity(a) * (100 - longest.used)) / total(longest.name);
+  };
+  return {
+    count: known.reduce((sum, a) => sum + (a.banked?.count ?? 0), 0),
+    // a reset whose account lists none is one with its expiry unknown: the count says it is there
+    credits: known.flatMap((a) =>
+      (a.banked?.credits ?? []).map((c) => {
+        const points = fill(a, c);
+        return points === undefined ? c : { ...c, fill: points };
+      }),
+    ),
+  };
 }
 
 /** Why the accounts are out of the pool, such as "claude 1 unreadable (HTTP 401), claude 2 disabled". */
