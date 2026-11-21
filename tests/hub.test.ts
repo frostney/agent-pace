@@ -4,11 +4,12 @@
 // all answered in the test.
 
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { constants } from "node:os";
 import { join } from "node:path";
 import { hoursToEmpty } from "../src/assess.ts";
-import { USAGE_URL } from "../src/claude.ts";
+import { USAGE_URL as LOCAL_CLAUDE_USAGE_URL } from "../src/claude.ts";
 import { main } from "../src/cli.ts";
 import { CODEX_RESET_CREDITS_URL, CODEX_USAGE_URL } from "../src/codex.ts";
 import type { Host } from "../src/host.ts";
@@ -17,6 +18,7 @@ import { Case, type Fields, iso, NOW } from "./harness.ts";
 
 setDefaultTimeout(30_000);
 
+const USAGE_URL = `${LOCAL_CLAUDE_USAGE_URL}&skip_spend=1`;
 const HUB = "https://hub.test:8317";
 const ACCESS_KEY = "sk-access-for-tests";
 const MANAGEMENT_KEY = "management-for-tests";
@@ -250,6 +252,28 @@ const get = (path: string, key: string | null = ACCESS_KEY, method = "GET") =>
     headers: key === null ? {} : { Authorization: `Bearer ${key}` },
   });
 
+function grantRequest(file: Fields = AUTH_FILES[0] as Fields, method = "GET", key = MANAGEMENT_KEY): Request {
+  const fields = ["id", "name", "email", "created_at", "modtime", "last_refresh"];
+  const revision = createHash("sha256")
+    .update(JSON.stringify(fields.map((field) => (typeof file[field] === "string" ? file[field] : null))))
+    .digest("hex");
+  return new Request(`http://127.0.0.1:8318/v1/claude/reset-grant?auth_index=${file.auth_index}`, {
+    method,
+    headers: { authorization: `Bearer ${key}`, "x-auth-revision": revision },
+  });
+}
+
+function grantUsage(id: string, endsAt = NOW + 3600, clears = ["five_hour"]): unknown {
+  return {
+    five_hour: { utilization: 100, resets_at: iso(NOW + 7200) },
+    cedar_ember: {
+      eligible: true,
+      next_grant_id: id,
+      grants: [{ id, resets_left: 1, usable_now: true, ends_at: iso(endsAt), clears }],
+    },
+  };
+}
+
 /** Sends the case's hub requests to the service, with the mount path stripped as tailscale serve does. */
 function connect(): void {
   const handle = service();
@@ -388,6 +412,88 @@ describe("HubService", () => {
         },
       })),
     );
+  });
+
+  test("pool, preview and confirmation share one Claude read without exposing the grant to pool clients", async () => {
+    const handle = service();
+    const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+    answers[USAGE_URL] = [200, grantUsage("grant_selected")];
+    expect((await handle(grantRequest(undefined, "GET", ACCESS_KEY))).status).toBe(401);
+    expect((await handle(grantRequest(undefined, "DELETE", ACCESS_KEY))).status).toBe(401);
+    const [pool, check] = await Promise.all([handle(get("/v1/usage/claude")), handle(grantRequest())]);
+    expect(await pool.text()).not.toContain("grant_selected");
+    expect(await check.json()).toEqual({
+      grant: { id: "grant_selected", expires_at: NOW + 3600, clears: ["5h"] },
+    });
+    // An immediate second upstream request would be rate limited.
+    answers[USAGE_URL] = [429, { message: "private response body" }];
+    expect(await (await handle(grantRequest())).json()).toMatchObject({ grant: { id: "grant_selected" } });
+    expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(1);
+
+    c.clock = NOW + 61;
+    mono += 61;
+    cliproxy.retryAfter = "0";
+    const throttled = await handle(grantRequest());
+    expect(throttled.status).toBe(429);
+    expect(throttled.headers.get("retry-after")).toBe("60");
+    c.clock += 59;
+    mono += 59;
+    expect((await handle(grantRequest())).headers.get("retry-after")).toBe("1");
+    const backedOffPool = (await (await handle(get("/v1/usage/claude"))).json()) as { accounts: Fields[] };
+    expect(backedOffPool.accounts[0]).toMatchObject({ detail: "HTTP 429", read_at: NOW });
+    expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(2);
+    expect(serviceErr).toContain("claude usage reset: HTTP 429");
+    expect(serviceErr).not.toContain("private response body");
+    expect(serviceErr).not.toContain("alice@example.com");
+
+    c.clock += 1;
+    mono += 1;
+    answers[USAGE_URL] = [200, grantUsage("new_grant")];
+    expect(await (await handle(grantRequest())).json()).toMatchObject({ grant: { id: "new_grant" } });
+  });
+
+  test("a relogin in the same slot and a grant expiry both reject a cached confirmation", async () => {
+    const handle = service();
+    const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+    answers[USAGE_URL] = [200, grantUsage("grant_old", NOW + 30)];
+    expect(await (await handle(grantRequest())).json()).toMatchObject({ grant: { id: "grant_old" } });
+    c.clock += 31;
+    mono += 31;
+    expect(await (await handle(grantRequest())).json()).toEqual({ grant: null });
+    expect(cliproxy.upstreamCalls()).toHaveLength(1);
+
+    const replacement = { ...cliproxy.files[0], modtime: iso(NOW + 31) };
+    cliproxy.files[0] = replacement;
+    answers[USAGE_URL] = [200, grantUsage("grant_new")];
+    expect((await handle(grantRequest())).status).toBe(409);
+    expect(await (await handle(grantRequest(replacement))).json()).toMatchObject({
+      grant: { id: "grant_new" },
+    });
+    expect(cliproxy.upstreamCalls()).toHaveLength(2);
+  });
+
+  test("a claim invalidates the old grant and pool reading without shortening an upstream backoff", async () => {
+    const handle = service();
+    const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+    answers[USAGE_URL] = [200, grantUsage("grant_before")];
+    const before = (await (await handle(get("/v1/usage/claude"))).json()) as { accounts: Fields[] };
+    expect(before.accounts[0]).toMatchObject({ banked: { count: 1 } });
+
+    expect((await handle(grantRequest(undefined, "DELETE"))).status).toBe(200);
+    answers[USAGE_URL] = [429, {}];
+    cliproxy.retryAfter = "180";
+    const checked = await handle(grantRequest());
+    expect(checked.status).toBe(429);
+    expect(checked.headers.get("retry-after")).toBe("180");
+    expect((await handle(grantRequest(undefined, "DELETE"))).status).toBe(200);
+    const after = (await (await handle(get("/v1/usage/claude"))).json()) as { accounts: Fields[] };
+    expect(after.accounts[0]).toMatchObject({ state: "unreadable", detail: "HTTP 429", banked: null });
+    expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(2);
+
+    c.clock += 181;
+    mono += 181;
+    answers[USAGE_URL] = [200, grantUsage("model_only", NOW + 3600, ["opus_weekly"])];
+    expect(await (await handle(grantRequest())).json()).toEqual({ grant: null });
   });
 
   test("limits tells a window that has not started from one the plan does not have", async () => {
@@ -915,7 +1021,7 @@ describe("HubClient", () => {
     const [out, err] = await c.runPace("claude");
     expect(err).toBe("");
     expect(out).toStartWith("12:25 claude: 5h 6% ");
-    expect(c.requests.map((r) => r.url)).toEqual([`${HUB}/agent-pace/v1/hub`, USAGE_URL]);
+    expect(c.requests.map((r) => r.url)).toEqual([`${HUB}/agent-pace/v1/hub`, LOCAL_CLAUDE_USAGE_URL]);
     c.hubFetch = async () => new Response('{"detail": "Not Found"}', { status: 401 });
     expect((await c.runPace("claude"))[0]).toStartWith("12:25 claude: 5h 6% ");
   });
@@ -924,14 +1030,14 @@ describe("HubClient", () => {
     claudeClient({ ANTHROPIC_BASE_URL: "http://hub.test:8317", ANTHROPIC_AUTH_TOKEN: ACCESS_KEY });
     const [out] = await c.runPace("claude");
     expect(out).toStartWith("12:25 claude: 5h 6% ");
-    expect(c.requests.map((r) => r.url)).toEqual([USAGE_URL]);
+    expect(c.requests.map((r) => r.url)).toEqual([LOCAL_CLAUDE_USAGE_URL]);
   });
 
   test("settings without the hub's two entries read this machine's own login, as before", async () => {
     claudeClient({ ANTHROPIC_BASE_URL: HUB }); // no token: not a hub client
     const [out] = await c.runPace("claude");
     expect(out).toStartWith("12:25 claude: 5h 6% ");
-    expect(c.requests.map((r) => r.url)).toEqual([USAGE_URL]);
+    expect(c.requests.map((r) => r.url)).toEqual([LOCAL_CLAUDE_USAGE_URL]);
   });
 
   test("a Codex config with another provider reads Codex as before", async () => {
@@ -1007,7 +1113,7 @@ describe("HubClient", () => {
     expect(out).toBe("");
     expect(err).toStartWith("agent-pace: <urlopen error ");
     expect(readFileSync(join(c.state, "claude-pool-hub"), "utf8")).toBe(HUB);
-    expect(c.requests.map((r) => r.url)).not.toContain(USAGE_URL);
+    expect(c.requests.map((r) => r.url)).not.toContain(LOCAL_CLAUDE_USAGE_URL);
   });
 
   test("a hub that answers /v1/hub with an error is still the hub", async () => {
@@ -1045,7 +1151,7 @@ describe("HubClient", () => {
       // The errno is the platform's own (61 on macOS, 111 on Linux), as src/claude.ts prints it.
       `agent-pace: <urlopen error [Errno ${constants.errno.ECONNREFUSED}] Connection refused>\n`,
     );
-    expect(c.requests.map((r) => r.url)).not.toContain(USAGE_URL);
+    expect(c.requests.map((r) => r.url)).not.toContain(LOCAL_CLAUDE_USAGE_URL);
   });
 
   test("an address that never answered as a hub and cannot be reached reads this machine as before", async () => {
@@ -1055,7 +1161,7 @@ describe("HubClient", () => {
     };
     const [out, err] = await c.runPace("claude");
     expect([err, out.split(" (")[0]]).toEqual(["", "12:25 claude: 5h 6% ? 1.17h left"]);
-    expect(c.requests.map((r) => r.url)).toEqual([`${HUB}/agent-pace/v1/hub`, USAGE_URL]);
+    expect(c.requests.map((r) => r.url)).toEqual([`${HUB}/agent-pace/v1/hub`, LOCAL_CLAUDE_USAGE_URL]);
   });
 
   test("--json's hub keys come in a fixed order", async () => {

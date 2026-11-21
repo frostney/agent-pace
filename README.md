@@ -440,17 +440,25 @@ under `/agent-pace`. Its options:
 - **Requests:** `GET /v1/usage/claude` and `GET /v1/usage/codex` (the same under
   `/agent-pace/`), with `Authorization: Bearer <access key>`, the key in `access-key`, compared
   in constant time. Without it: 401. `GET /v1/hub` with the key answers `{"version": 1}` without
-  reading any account. Anything else: 404, or 405 for another method.
+  reading any account.
 - **Upstream:** only GETs. For a Claude account, the usage endpoint Claude Code's `/usage`
-  reads (as above, with `?cedar_ember=1` for the banked resets). For a Codex account,
+  reads (with `cedar_ember=1` for banked resets and `skip_spend=1` to omit spend data). For a Codex account,
   `https://chatgpt.com/backend-api/wham/usage`, the endpoint Codex reads its rate limits from,
   and, when that says resets are banked, `.../wham/rate-limit-reset-credits` for their expiries.
   It never redeems or claims a reset.
-- **Cache:** each provider's accounts are read at most once a minute, however many clients ask;
-  a failed read is not kept. An account whose usage endpoint answers 429 is not asked again
-  until its `Retry-After` has passed (10 minutes without one), and an account whose read fails
-  is answered with its last good reading for up to half an hour, its `detail` saying why and
-  `read_at` when it was read.
+- **Cache:** pool snapshots are kept for a minute. Claude pool reads and reset checks share
+  each account's one-minute reading and any request already in flight. After HTTP 429 the
+  service waits for at least a minute, or longer if `Retry-After` asks for it. With no usable
+  hint it waits ten minutes. The pool can show its last good reading for up to half an hour
+  after an error, with `detail` and `read_at` showing what happened and when the data was read.
+- **Reset checks:** a local dashboard with the management key can call
+  `GET /v1/claude/reset-grant?auth_index=…` to check the exact usable grant. The
+  `X-Auth-Revision` header is the SHA-256 hex digest of the UTF-8 JSON array of the credential's
+  `id`, `name`, `email`, `created_at`, `modtime` and `last_refresh` from `auth-files`, in that
+  order, using null for absent or non-string values. The check refuses failed or superseded
+  readings and returns the remaining wait on HTTP 429. After making a claim, the dashboard
+  uses DELETE on the same route to invalidate the reading while preserving any backoff.
+  The service logs the upstream status and which path started the read.
 - **Answer:** `{"version": 1, "provider", "observed_at", "accounts": [...]}`, each account with
   `label`, `plan`, `weight`, `cooling_down`, `state`, `detail`, `read_at`, `windows` (`name`,
   `used`, `resets_at`, `length_s`; times in unix seconds), `limits` (the names of the windows the
