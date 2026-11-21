@@ -570,11 +570,11 @@ describe("HubService", () => {
     const preview = handle(grantRequest());
     await started.promise;
     oldList.resolve(Response.json({ files: cliproxy.files.slice(1) }));
-    await oldPool;
+    await Bun.sleep(0);
     const confirm = handle(grantRequest(undefined, "POST", MANAGEMENT_KEY, "grant_before"));
     await Bun.sleep(0);
     resume.resolve();
-    await preview;
+    await Promise.all([preview, oldPool]);
     expect((await confirm).status).toBe(200);
     expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(1);
 
@@ -583,6 +583,62 @@ describe("HubService", () => {
     answers[USAGE_URL] = [429, {}];
     const read = (await (await handle(get("/v1/usage/claude"))).json()) as { accounts: Fields[] };
     expect(read.accounts[0]).toMatchObject({ state: "unreadable", detail: "HTTP 429", banked: null });
+  });
+
+  test.each([false, true])(
+    "an older list cannot start a second read (removed account: %s)",
+    async (removed) => {
+      const handle = service();
+      const original = cliproxy.files[0] as Fields;
+      const current = { ...original, modtime: iso(NOW) };
+      const stale = removed ? cliproxy.files.slice(1) : [...cliproxy.files];
+      cliproxy.files[0] = current;
+      const listed = Promise.withResolvers<void>();
+      const oldList = Promise.withResolvers<Response>();
+      cliproxy.onList = () => {
+        cliproxy.onList = undefined;
+        listed.resolve();
+        return oldList.promise;
+      };
+      const oldPool = handle(get("/v1/usage/claude"));
+      await listed.promise;
+
+      const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+      answers[USAGE_URL] = [200, grantUsage("selected")];
+      expect((await handle(grantRequest(current))).status).toBe(200);
+      answers[USAGE_URL] = [429, {}];
+      oldList.resolve(Response.json({ files: stale }));
+      const pool = (await (await oldPool).json()) as { accounts: Fields[] };
+      expect(pool.accounts[0]).toMatchObject({ label: "work", banked: { count: 1 }, detail: null });
+      expect(await (await handle(grantRequest(current))).json()).toMatchObject({ grant: { id: "selected" } });
+      expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(1);
+    },
+  );
+
+  test("a pool response held open through a reset cannot return the pre-claim banked count", async () => {
+    const handle = service();
+    const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+    answers[USAGE_URL] = [200, grantUsage("before_claim")];
+    const started = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    cliproxy.onRelay = async (call) => {
+      if (call.auth_index === "b2") {
+        started.resolve();
+        await resume.promise;
+      }
+    };
+    const oldPool = handle(get("/v1/usage/claude"));
+    await started.promise;
+    const prepared = await handle(grantRequest(undefined, "POST", MANAGEMENT_KEY, "before_claim"));
+    expect(prepared.status).toBe(200);
+    const { reservation } = (await prepared.json()) as { reservation: string };
+    answers[USAGE_URL] = [429, {}];
+    await handle(grantRequest(undefined, "DELETE", MANAGEMENT_KEY, reservation));
+    resume.resolve();
+
+    const pool = (await (await oldPool).json()) as { accounts: Fields[] };
+    expect(pool.accounts[0]).toMatchObject({ state: "unreadable", banked: null, detail: "HTTP 429" });
+    expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(2);
   });
 
   test("metadata changes and disable/enable keep the account's active usage backoff", async () => {

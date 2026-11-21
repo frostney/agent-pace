@@ -524,15 +524,40 @@ function accountKey(provider: Source, index: string, file: Record<string, unknow
   return provider === "claude" ? claudeAccountKey(index, claudeRevision(file)) : `codex\u0000${index}`;
 }
 
+/** Concurrent list requests can complete out of order. Later requests own the current list. */
+class AccountDirectory {
+  private sequence = 0;
+  private readonly latest = new Map<Source, { requested: number; files: Record<string, unknown>[] }>();
+
+  constructor(
+    private readonly options: HubServeOptions,
+    private readonly host: Host,
+  ) {}
+
+  async refresh(provider: Source, managementKey: string): Promise<void> {
+    const requested = ++this.sequence;
+    const files = await listAccounts(provider, this.options, managementKey, this.host);
+    if (requested > (this.latest.get(provider)?.requested ?? 0)) {
+      this.latest.set(provider, { requested, files });
+    }
+  }
+
+  files(provider: Source): readonly Record<string, unknown>[] {
+    return this.latest.get(provider)?.files ?? [];
+  }
+}
+
 /** Every account of one provider on the hub, read upstream now (or from memory, see AccountMemory). */
 async function readProvider(
   provider: Source,
   options: HubServeOptions,
   memory: AccountMemory,
+  directory: AccountDirectory,
   host: Host,
 ): Promise<{ body: JsonObject; freshUntil: number }> {
   const managementKey = keyFile(options, "management-key");
-  const mine = await listAccounts(provider, options, managementKey, host);
+  await directory.refresh(provider, managementKey);
+  const mine = directory.files(provider);
   const version = provider === "claude" ? claudeVersion(options, host) : "";
   const observedAt = host.now();
   memory.keepOnly(
@@ -614,16 +639,18 @@ async function readProvider(
  */
 export function hubHandler(options: HubServeOptions, host: Host): (request: Request) => Promise<Response> {
   const memory = new AccountMemory();
+  const directory = new AccountDirectory(options, host);
   type Snapshot = { body: JsonObject; freshUntil: number };
-  const cache = new Map<Source, { until: number | null; value: Promise<Snapshot> }>();
-  const cached = (provider: Source): Promise<Snapshot> => {
+  type PoolRead = { until: number | null; value: Promise<Snapshot> };
+  const cache = new Map<Source, PoolRead>();
+  const cached = (provider: Source): PoolRead => {
     const hit = cache.get(provider);
     if (hit && (hit.until === null || host.monotonic() < hit.until)) {
-      return hit.value;
+      return hit;
     }
-    const entry: { until: number | null; value: Promise<Snapshot> } = {
+    const entry: PoolRead = {
       until: null,
-      value: readProvider(provider, options, memory, host),
+      value: readProvider(provider, options, memory, directory, host),
     };
     cache.set(provider, entry);
     entry.value.then(
@@ -636,8 +663,19 @@ export function hubHandler(options: HubServeOptions, host: Host): (request: Requ
         }
       },
     );
-    return entry.value;
+    return entry;
   };
+
+  async function poolResponse(provider: Source): Promise<Response> {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const entry = cached(provider);
+      const { body } = await entry.value;
+      if (cache.get(provider) === entry) {
+        return answer(200, body);
+      }
+    }
+    return answer(503, { error: "the usage changed while it was read; try again" });
+  }
 
   async function resetGrant(request: Request, url: URL): Promise<Response> {
     const managementKey = keyFile(options, "management-key");
@@ -666,8 +704,8 @@ export function hubHandler(options: HubServeOptions, host: Host): (request: Requ
       requestedGrant = body.grant;
     }
     const sameCredential = async (): Promise<boolean> => {
-      const files = await listAccounts("claude", options, managementKey, host);
-      const file = files.find((candidate) => candidate.auth_index === index);
+      await directory.refresh("claude", managementKey);
+      const file = directory.files("claude").find((candidate) => candidate.auth_index === index);
       return file !== undefined && file.disabled !== true && claudeRevision(file) === revision;
     };
     const credentialChanged = () =>
@@ -756,7 +794,7 @@ export function hubHandler(options: HubServeOptions, host: Host): (request: Requ
       if (provider === undefined) {
         return answer(200, { version: HUB_ANSWER_VERSION });
       }
-      return answer(200, (await cached(provider)).body);
+      return await poolResponse(provider);
     } catch (error) {
       const failure =
         error instanceof HubFailure
