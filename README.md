@@ -456,8 +456,10 @@ under `/agent-pace`. Its options:
   `X-Auth-Revision` header is the SHA-256 hex digest of the UTF-8 JSON array of the credential's
   `id`, `name`, `email`, `created_at`, `modtime` and `last_refresh` from `auth-files`, in that
   order, using null for absent or non-string values. The check refuses failed or superseded
-  readings and returns the remaining wait on HTTP 429. After making a claim, the dashboard
-  uses DELETE on the same route to invalidate the reading while preserving any backoff.
+  readings and returns the remaining wait on HTTP 429. Before claiming, the dashboard uses
+  POST on the same route with `{"grant":"<confirmed id>"}` to recheck the grant and discard the
+  old observation. The reservation pauses reads of that credential for up to a minute. After
+  claiming, DELETE with the returned reservation in `X-Reset-Reservation` ends that pause.
   The service logs the upstream status and which path started the read.
 - **Answer:** `{"version": 1, "provider", "observed_at", "accounts": [...]}`, each account with
   `label`, `plan`, `weight`, `cooling_down`, `state`, `detail`, `read_at`, `windows` (`name`,

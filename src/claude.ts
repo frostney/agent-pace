@@ -121,12 +121,14 @@ export function claudeResetGrant(
     return null;
   }
   const next = block.grants.find((grant) => isRecord(grant) && grant.id === block.next_grant_id);
+  const resetsLeft = isRecord(next) ? amountOf(next.resets_left) : null;
   if (
     !isRecord(next) ||
     typeof next.id !== "string" ||
     !/^[a-z0-9_-]{1,40}$/.test(next.id) ||
-    !isPythonInt(next.resets_left) ||
-    Number(next.resets_left) <= 0 ||
+    resetsLeft === null ||
+    !Number.isInteger(resetsLeft) ||
+    resetsLeft <= 0 ||
     next.paused === true ||
     next.usable_now !== true
   ) {
