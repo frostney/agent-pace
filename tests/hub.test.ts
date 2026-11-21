@@ -4,19 +4,22 @@
 // all answered in the test.
 
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { constants } from "node:os";
 import { join } from "node:path";
 import { hoursToEmpty } from "../src/assess.ts";
-import { USAGE_URL } from "../src/claude.ts";
+import { claudeResetGrant, USAGE_URL as LOCAL_CLAUDE_USAGE_URL } from "../src/claude.ts";
 import { main } from "../src/cli.ts";
 import { CODEX_RESET_CREDITS_URL, CODEX_USAGE_URL } from "../src/codex.ts";
 import type { Host } from "../src/host.ts";
 import { HUB_CACHE_S, hubHandler, parseHubArgs, startHub } from "../src/hub-serve.ts";
+import { parseJson } from "../src/python-json.ts";
 import { Case, type Fields, iso, NOW } from "./harness.ts";
 
 setDefaultTimeout(30_000);
 
+const USAGE_URL = `${LOCAL_CLAUDE_USAGE_URL}&skip_spend=1`;
 const HUB = "https://hub.test:8317";
 const ACCESS_KEY = "sk-access-for-tests";
 const MANAGEMENT_KEY = "management-for-tests";
@@ -179,6 +182,8 @@ class FakeCliproxy {
   files: Fields[] = AUTH_FILES.map((f) => ({ ...f }));
   answers = upstreamAnswers();
   listStatus = 200;
+  onList: (() => Promise<Response>) | undefined;
+  onRelay: ((body: Fields) => void | Promise<void>) | undefined;
   /** The Retry-After the upstream sends with a 429, as api-call reports it. */
   retryAfter: string | null = null;
   readonly calls: { path: string; authorization: string | null; body: Fields | null }[] = [];
@@ -195,9 +200,12 @@ class FakeCliproxy {
       return new Response('{"error":"invalid management key"}', { status: 401 });
     }
     if (parsed.pathname === "/v0/management/auth-files" && (init.method ?? "GET") === "GET") {
-      return new Response(JSON.stringify({ files: this.files }), { status: this.listStatus });
+      return (
+        this.onList?.() ?? new Response(JSON.stringify({ files: this.files }), { status: this.listStatus })
+      );
     }
     if (parsed.pathname === "/v0/management/api-call" && init.method === "POST" && body) {
+      await this.onRelay?.(body);
       const [status, answer] = this.answers[String(body.auth_index)]?.[String(body.url)] ?? [404, {}];
       const header = status === 429 && this.retryAfter ? { "Retry-After": [this.retryAfter] } : {};
       return new Response(JSON.stringify({ status_code: status, header, body: JSON.stringify(answer) }));
@@ -238,10 +246,12 @@ function serviceHost(): Host {
 
 function service() {
   const keys = writeKeys(c.dir);
-  return hubHandler(
-    { port: 8318, keys, cliproxy: "http://127.0.0.1:8317", state: join(c.dir, "hub-state") },
-    serviceHost(),
-  );
+  const state = join(c.dir, "hub-state");
+  mkdirSync(state, { recursive: true });
+  const version = join(state, "claude-cli-version");
+  writeFileSync(version, "2.1.999");
+  utimesSync(version, c.clock, c.clock);
+  return hubHandler({ port: 8318, keys, cliproxy: "http://127.0.0.1:8317", state }, serviceHost());
 }
 
 const get = (path: string, key: string | null = ACCESS_KEY, method = "GET") =>
@@ -249,6 +259,39 @@ const get = (path: string, key: string | null = ACCESS_KEY, method = "GET") =>
     method,
     headers: key === null ? {} : { Authorization: `Bearer ${key}` },
   });
+
+function grantRequest(
+  file: Fields = AUTH_FILES[0] as Fields,
+  method = "GET",
+  key = MANAGEMENT_KEY,
+  value = "unused",
+): Request {
+  const fields = ["id", "name", "email", "created_at", "modtime", "last_refresh"];
+  const revision = createHash("sha256")
+    .update(JSON.stringify(fields.map((field) => (typeof file[field] === "string" ? file[field] : null))))
+    .digest("hex");
+  return new Request(`http://127.0.0.1:8318/v1/claude/reset-grant?auth_index=${file.auth_index}`, {
+    method,
+    headers: {
+      authorization: `Bearer ${key}`,
+      "x-auth-revision": revision,
+      ...(method === "POST" ? { "content-type": "application/json" } : {}),
+      ...(method === "DELETE" ? { "x-reset-reservation": value } : {}),
+    },
+    ...(method === "POST" ? { body: JSON.stringify({ grant: value }) } : {}),
+  });
+}
+
+function grantUsage(id: string, endsAt = NOW + 3600, clears = ["five_hour"]): unknown {
+  return {
+    five_hour: { utilization: 100, resets_at: iso(NOW + 7200) },
+    cedar_ember: {
+      eligible: true,
+      next_grant_id: id,
+      grants: [{ id, resets_left: 1, usable_now: true, ends_at: iso(endsAt), clears }],
+    },
+  };
+}
 
 /** Sends the case's hub requests to the service, with the mount path stripped as tailscale serve does. */
 function connect(): void {
@@ -388,6 +431,263 @@ describe("HubService", () => {
         },
       })),
     );
+  });
+
+  test("pool, preview and confirmation share one Claude read without exposing the grant to pool clients", async () => {
+    const handle = service();
+    const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+    answers[USAGE_URL] = [200, grantUsage("grant_selected")];
+    expect((await handle(grantRequest(undefined, "GET", ACCESS_KEY))).status).toBe(401);
+    expect((await handle(grantRequest(undefined, "DELETE", ACCESS_KEY))).status).toBe(401);
+    const [pool, check] = await Promise.all([handle(get("/v1/usage/claude")), handle(grantRequest())]);
+    expect(await pool.text()).not.toContain("grant_selected");
+    expect(await check.json()).toEqual({
+      grant: { id: "grant_selected", expires_at: NOW + 3600, clears: ["5h"] },
+    });
+    // An immediate second upstream request would be rate limited.
+    answers[USAGE_URL] = [429, { message: "private response body" }];
+    expect(await (await handle(grantRequest())).json()).toMatchObject({ grant: { id: "grant_selected" } });
+    expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(1);
+
+    c.clock = NOW + 61;
+    mono += 61;
+    cliproxy.retryAfter = "0";
+    const throttled = await handle(grantRequest());
+    expect(throttled.status).toBe(429);
+    expect(throttled.headers.get("retry-after")).toBe("60");
+    c.clock += 59;
+    mono += 59;
+    expect((await handle(grantRequest())).headers.get("retry-after")).toBe("1");
+    const backedOffPool = (await (await handle(get("/v1/usage/claude"))).json()) as { accounts: Fields[] };
+    expect(backedOffPool.accounts[0]).toMatchObject({ detail: "HTTP 429", read_at: NOW });
+    expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(2);
+    expect(serviceErr).toContain("claude usage reset: HTTP 429");
+    expect(serviceErr).not.toContain("private response body");
+    expect(serviceErr).not.toContain("alice@example.com");
+
+    c.clock += 1;
+    mono += 1;
+    answers[USAGE_URL] = [200, grantUsage("new_grant")];
+    expect(await (await handle(grantRequest())).json()).toMatchObject({ grant: { id: "new_grant" } });
+  });
+
+  test("a relogin in the same slot and a grant expiry both reject a cached confirmation", async () => {
+    const handle = service();
+    const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+    answers[USAGE_URL] = [200, grantUsage("grant_old", NOW + 30)];
+    expect(await (await handle(grantRequest())).json()).toMatchObject({ grant: { id: "grant_old" } });
+    c.clock += 31;
+    mono += 31;
+    expect(await (await handle(grantRequest())).json()).toEqual({ grant: null });
+    expect(cliproxy.upstreamCalls()).toHaveLength(1);
+
+    const replacement = { ...cliproxy.files[0], modtime: iso(NOW + 31) };
+    cliproxy.files[0] = replacement;
+    answers[USAGE_URL] = [200, grantUsage("grant_new")];
+    expect((await handle(grantRequest())).status).toBe(409);
+    expect(await (await handle(grantRequest(replacement))).json()).toMatchObject({
+      grant: { id: "grant_new" },
+    });
+    expect(cliproxy.upstreamCalls()).toHaveLength(2);
+  });
+
+  test("a credential changed during the usage call cannot yield a reservable grant", async () => {
+    const handle = service();
+    const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+    answers[USAGE_URL] = [200, grantUsage("grant_before")];
+    cliproxy.onRelay = (call) => {
+      if (call.auth_index === "a1") {
+        cliproxy.files[0] = { ...cliproxy.files[0], modtime: iso(NOW + 1) };
+      }
+    };
+    const checked = await handle(grantRequest(undefined, "POST", MANAGEMENT_KEY, "grant_before"));
+    expect(checked.status).toBe(409);
+    expect(await checked.json()).toMatchObject({ code: "credential_changed" });
+    expect(cliproxy.upstreamCalls()).toHaveLength(1);
+  });
+
+  test("a reservation discards the old observation even when the claim response is lost", async () => {
+    const handle = service();
+    const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+    answers[USAGE_URL] = [200, grantUsage("grant_before")];
+    const before = (await (await handle(get("/v1/usage/claude"))).json()) as { accounts: Fields[] };
+    expect(before.accounts[0]).toMatchObject({ banked: { count: 1 } });
+    const reserve = (id: string) => grantRequest(undefined, "POST", MANAGEMENT_KEY, id);
+    expect((await handle(reserve("other_grant"))).status).toBe(409);
+    const prepared = await handle(reserve("grant_before"));
+    expect(prepared.status).toBe(200);
+    const { reservation } = (await prepared.json()) as { reservation: string };
+    expect(reservation).toBeTruthy();
+
+    // The claimant disappears without releasing its reservation; an unrelated release cannot unlock it.
+    await handle(grantRequest(undefined, "DELETE", MANAGEMENT_KEY, "not-the-reservation"));
+    expect((await handle(grantRequest())).status).toBe(409);
+    expect((await handle(reserve("grant_before"))).status).toBe(409);
+    const held = (await (await handle(get("/v1/usage/claude"))).json()) as { accounts: Fields[] };
+    expect(held.accounts[0]).toMatchObject({
+      state: "unreadable",
+      detail: "a Claude reset is in progress",
+      banked: null,
+    });
+    expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(1);
+
+    c.clock += 60;
+    mono += 60;
+    answers[USAGE_URL] = [429, {}];
+    cliproxy.retryAfter = "180";
+    const after = (await (await handle(get("/v1/usage/claude"))).json()) as { accounts: Fields[] };
+    expect(after.accounts[0]).toMatchObject({ state: "unreadable", detail: "HTTP 429", banked: null });
+    const checked = await handle(grantRequest());
+    expect(checked.status).toBe(429);
+    expect(checked.headers.get("retry-after")).toBe("180");
+    await handle(grantRequest(undefined, "DELETE", MANAGEMENT_KEY, reservation));
+    expect((await handle(grantRequest())).status).toBe(429);
+    expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(2);
+  });
+
+  test("an older listing cannot evict a read in flight or restore a grant after reservation", async () => {
+    const handle = service();
+    const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+    answers[USAGE_URL] = [200, grantUsage("grant_before")];
+    const listed = Promise.withResolvers<void>();
+    const oldList = Promise.withResolvers<Response>();
+    cliproxy.onList = () => {
+      cliproxy.onList = undefined;
+      listed.resolve();
+      return oldList.promise;
+    };
+    const oldPool = handle(get("/v1/usage/claude"));
+    await listed.promise;
+
+    const started = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    cliproxy.onRelay = async (call) => {
+      if (call.auth_index === "a1") {
+        started.resolve();
+        await resume.promise;
+      }
+    };
+    const preview = handle(grantRequest());
+    await started.promise;
+    oldList.resolve(Response.json({ files: cliproxy.files.slice(1) }));
+    await Bun.sleep(0);
+    const confirm = handle(grantRequest(undefined, "POST", MANAGEMENT_KEY, "grant_before"));
+    await Bun.sleep(0);
+    resume.resolve();
+    await Promise.all([preview, oldPool]);
+    expect((await confirm).status).toBe(200);
+    expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(1);
+
+    c.clock += 60;
+    mono += 60;
+    answers[USAGE_URL] = [429, {}];
+    const read = (await (await handle(get("/v1/usage/claude"))).json()) as { accounts: Fields[] };
+    expect(read.accounts[0]).toMatchObject({ state: "unreadable", detail: "HTTP 429", banked: null });
+  });
+
+  test.each([false, true])(
+    "an older list cannot start a second read (removed account: %s)",
+    async (removed) => {
+      const handle = service();
+      const original = cliproxy.files[0] as Fields;
+      const current = { ...original, modtime: iso(NOW) };
+      const stale = removed ? cliproxy.files.slice(1) : [...cliproxy.files];
+      cliproxy.files[0] = current;
+      const listed = Promise.withResolvers<void>();
+      const oldList = Promise.withResolvers<Response>();
+      cliproxy.onList = () => {
+        cliproxy.onList = undefined;
+        listed.resolve();
+        return oldList.promise;
+      };
+      const oldPool = handle(get("/v1/usage/claude"));
+      await listed.promise;
+
+      const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+      answers[USAGE_URL] = [200, grantUsage("selected")];
+      expect((await handle(grantRequest(current))).status).toBe(200);
+      answers[USAGE_URL] = [429, {}];
+      oldList.resolve(Response.json({ files: stale }));
+      const pool = (await (await oldPool).json()) as { accounts: Fields[] };
+      expect(pool.accounts[0]).toMatchObject({ label: "work", banked: { count: 1 }, detail: null });
+      expect(await (await handle(grantRequest(current))).json()).toMatchObject({ grant: { id: "selected" } });
+      expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(1);
+    },
+  );
+
+  test("a pool response held open through a reset cannot return the pre-claim banked count", async () => {
+    const handle = service();
+    const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+    answers[USAGE_URL] = [200, grantUsage("before_claim")];
+    const started = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    cliproxy.onRelay = async (call) => {
+      if (call.auth_index === "b2") {
+        started.resolve();
+        await resume.promise;
+      }
+    };
+    const oldPool = handle(get("/v1/usage/claude"));
+    await started.promise;
+    const prepared = await handle(grantRequest(undefined, "POST", MANAGEMENT_KEY, "before_claim"));
+    expect(prepared.status).toBe(200);
+    const { reservation } = (await prepared.json()) as { reservation: string };
+    answers[USAGE_URL] = [429, {}];
+    await handle(grantRequest(undefined, "DELETE", MANAGEMENT_KEY, reservation));
+    resume.resolve();
+
+    const pool = (await (await oldPool).json()) as { accounts: Fields[] };
+    expect(pool.accounts[0]).toMatchObject({ state: "unreadable", banked: null, detail: "HTTP 429" });
+    expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(2);
+  });
+
+  test("metadata changes and disable/enable keep the account's active usage backoff", async () => {
+    const handle = service();
+    const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+    answers[USAGE_URL] = [429, {}];
+    cliproxy.retryAfter = "180";
+    expect((await handle(grantRequest())).status).toBe(429);
+    c.clock += 61;
+    mono += 61;
+    const newFile = { ...cliproxy.files[0], modtime: iso(c.clock) };
+    cliproxy.files[0] = { ...newFile, disabled: true };
+    await handle(get("/v1/usage/claude"));
+    cliproxy.files[0] = newFile;
+    const check = await handle(grantRequest(newFile));
+    expect(check.status).toBe(429);
+    expect(check.headers.get("retry-after")).toBe("119");
+    expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(1);
+  });
+
+  test("a pool snapshot expires with its oldest fresh Claude observation", async () => {
+    const handle = service();
+    const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+    answers[USAGE_URL] = [200, grantUsage("grant_before")];
+    await handle(grantRequest());
+    c.clock += 59;
+    mono += 59;
+    await handle(get("/v1/usage/claude"));
+    expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(1);
+    c.clock += 1;
+    mono += 1;
+    const after = (await (await handle(get("/v1/usage/claude"))).json()) as { accounts: Fields[] };
+    expect(after.accounts[0]?.read_at).toBe(NOW + 60);
+    expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(2);
+  });
+
+  test("an invalid reset count or a reset for other windows is never offered", async () => {
+    const handle = service();
+    const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+    const malformed = grantUsage("model_only") as { cedar_ember: { grants: Fields[] } };
+    const encoded = JSON.stringify(malformed).replace('"resets_left":1', '"resets_left":1.0');
+    expect(claudeResetGrant(parseJson(encoded), NOW)?.id).toBe("model_only");
+    (malformed.cedar_ember.grants[0] as Fields).resets_left = true;
+    answers[USAGE_URL] = [200, malformed];
+    expect(await (await handle(grantRequest())).json()).toEqual({ grant: null });
+    c.clock += 61;
+    mono += 61;
+    answers[USAGE_URL] = [200, grantUsage("model_only", NOW + 3600, ["opus_weekly"])];
+    expect(await (await handle(grantRequest())).json()).toEqual({ grant: null });
   });
 
   test("limits tells a window that has not started from one the plan does not have", async () => {
@@ -915,7 +1215,7 @@ describe("HubClient", () => {
     const [out, err] = await c.runPace("claude");
     expect(err).toBe("");
     expect(out).toStartWith("12:25 claude: 5h 6% ");
-    expect(c.requests.map((r) => r.url)).toEqual([`${HUB}/agent-pace/v1/hub`, USAGE_URL]);
+    expect(c.requests.map((r) => r.url)).toEqual([`${HUB}/agent-pace/v1/hub`, LOCAL_CLAUDE_USAGE_URL]);
     c.hubFetch = async () => new Response('{"detail": "Not Found"}', { status: 401 });
     expect((await c.runPace("claude"))[0]).toStartWith("12:25 claude: 5h 6% ");
   });
@@ -924,14 +1224,14 @@ describe("HubClient", () => {
     claudeClient({ ANTHROPIC_BASE_URL: "http://hub.test:8317", ANTHROPIC_AUTH_TOKEN: ACCESS_KEY });
     const [out] = await c.runPace("claude");
     expect(out).toStartWith("12:25 claude: 5h 6% ");
-    expect(c.requests.map((r) => r.url)).toEqual([USAGE_URL]);
+    expect(c.requests.map((r) => r.url)).toEqual([LOCAL_CLAUDE_USAGE_URL]);
   });
 
   test("settings without the hub's two entries read this machine's own login, as before", async () => {
     claudeClient({ ANTHROPIC_BASE_URL: HUB }); // no token: not a hub client
     const [out] = await c.runPace("claude");
     expect(out).toStartWith("12:25 claude: 5h 6% ");
-    expect(c.requests.map((r) => r.url)).toEqual([USAGE_URL]);
+    expect(c.requests.map((r) => r.url)).toEqual([LOCAL_CLAUDE_USAGE_URL]);
   });
 
   test("a Codex config with another provider reads Codex as before", async () => {
@@ -1007,7 +1307,7 @@ describe("HubClient", () => {
     expect(out).toBe("");
     expect(err).toStartWith("agent-pace: <urlopen error ");
     expect(readFileSync(join(c.state, "claude-pool-hub"), "utf8")).toBe(HUB);
-    expect(c.requests.map((r) => r.url)).not.toContain(USAGE_URL);
+    expect(c.requests.map((r) => r.url)).not.toContain(LOCAL_CLAUDE_USAGE_URL);
   });
 
   test("a hub that answers /v1/hub with an error is still the hub", async () => {
@@ -1045,7 +1345,7 @@ describe("HubClient", () => {
       // The errno is the platform's own (61 on macOS, 111 on Linux), as src/claude.ts prints it.
       `agent-pace: <urlopen error [Errno ${constants.errno.ECONNREFUSED}] Connection refused>\n`,
     );
-    expect(c.requests.map((r) => r.url)).not.toContain(USAGE_URL);
+    expect(c.requests.map((r) => r.url)).not.toContain(LOCAL_CLAUDE_USAGE_URL);
   });
 
   test("an address that never answered as a hub and cannot be reached reads this machine as before", async () => {
@@ -1055,7 +1355,7 @@ describe("HubClient", () => {
     };
     const [out, err] = await c.runPace("claude");
     expect([err, out.split(" (")[0]]).toEqual(["", "12:25 claude: 5h 6% ? 1.17h left"]);
-    expect(c.requests.map((r) => r.url)).toEqual([`${HUB}/agent-pace/v1/hub`, USAGE_URL]);
+    expect(c.requests.map((r) => r.url)).toEqual([`${HUB}/agent-pace/v1/hub`, LOCAL_CLAUDE_USAGE_URL]);
   });
 
   test("--json's hub keys come in a fixed order", async () => {

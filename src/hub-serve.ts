@@ -10,7 +10,7 @@
 // is left alone as long as it asked. It answers with each account's windows and banked resets
 // and never with a token, an email address or an upstream body.
 
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -18,6 +18,7 @@ import {
   claudeBanked,
   claudeCliVersion,
   claudeLimits,
+  claudeResetGrant,
   claudeUsageHeaders,
   claudeWindows,
   USAGE_URL,
@@ -103,7 +104,12 @@ export const HUB_STALE_S = 30 * 60;
 /** How long an account is left alone after its usage endpoint said 429 without a Retry-After. */
 export const HUB_BACKOFF_S = 600;
 
-type Upstream = { readonly data: unknown } | { readonly detail: string; readonly retryAfter: number | null };
+type ReadFailure = {
+  readonly detail: string;
+  readonly retryAfter: number | null;
+  readonly upstreamStatus?: number | undefined;
+};
+type Upstream = { readonly data: unknown } | ReadFailure;
 
 /** The Retry-After seconds in api-call's header map (header name to list of values). */
 function retryAfter(headers: unknown): number | null {
@@ -125,6 +131,7 @@ async function upstream(
   url: string,
   header: Record<string, string>,
   host: Host,
+  logStatus?: (status: number | null) => void,
 ): Promise<Upstream> {
   let response: Response;
   try {
@@ -135,17 +142,24 @@ async function upstream(
       signal: AbortSignal.timeout(20_000),
     });
   } catch {
+    logStatus?.(null);
     return { detail: "the hub did not answer", retryAfter: null };
   }
   if (response.status !== 200) {
+    logStatus?.(null);
     return { detail: `the hub could not make the call (HTTP ${response.status})`, retryAfter: null };
   }
   try {
     const call = parseJson(await response.text());
     const status = get(call, "status_code");
+    logStatus?.(typeof status === "number" ? status : null);
     if (typeof status !== "number" || status < 200 || status > 299) {
       const limited = status === 429 ? (retryAfter(get(call, "header")) ?? HUB_BACKOFF_S) : null;
-      return { detail: `HTTP ${typeof status === "number" ? status : "?"}`, retryAfter: limited };
+      return {
+        detail: `HTTP ${typeof status === "number" ? status : "?"}`,
+        retryAfter: limited,
+        upstreamStatus: typeof status === "number" ? status : undefined,
+      };
     }
     const body = get(call, "body");
     return { data: parseJson(typeof body === "string" ? body : "") };
@@ -160,10 +174,12 @@ interface AccountRead {
   readonly limits: string[] | null;
   readonly banked: Banked | null;
   readonly plan: string | null;
+  readonly grant?: ReturnType<typeof claudeResetGrant>;
 }
 
-type ReadResult = AccountRead | { readonly detail: string; readonly retryAfter: number | null };
+type ReadResult = AccountRead | ReadFailure;
 
+const RESET_IN_PROGRESS = { detail: "a Claude reset is in progress", retryAfter: null };
 const UNREADABLE = { detail: "an answer agent-pace does not read", retryAfter: null };
 
 async function readClaudeAccount(
@@ -172,9 +188,22 @@ async function readClaudeAccount(
   authIndex: string,
   version: string,
   host: Host,
+  source: "pool" | "reset",
 ): Promise<ReadResult> {
   const header = claudeUsageHeaders("Bearer $TOKEN$", version);
-  const got = await upstream(options, managementKey, authIndex, USAGE_URL, header, host);
+  // The pool only needs windows and grants; skip the unrelated spend lookup.
+  const got = await upstream(
+    options,
+    managementKey,
+    authIndex,
+    `${USAGE_URL}&skip_spend=1`,
+    header,
+    host,
+    (status) =>
+      host.stderr(
+        `agent-pace hub: claude usage ${source}: ${status === null ? "no upstream status" : `HTTP ${status}`}\n`,
+      ),
+  );
   if ("detail" in got) {
     return got;
   }
@@ -184,6 +213,7 @@ async function readClaudeAccount(
       limits: claudeLimits(got.data),
       banked: claudeBanked(got.data).banked,
       plan: null,
+      grant: claudeResetGrant(got.data, host.now()),
     };
   } catch {
     return UNREADABLE;
@@ -261,19 +291,135 @@ function bankedJson(banked: Banked | null): Json {
  * fails for a while (often a 429) stays in the pool with what it last said, and how long a 429
  * asked to be left alone.
  */
+type Observation = {
+  readonly read: AccountRead;
+  readonly at: number;
+  readonly detail: string | null;
+  readonly failure?: ReadFailure;
+};
+type AccountObservation = Observation | ReadFailure;
+type CachedRead = {
+  readonly key: string;
+  at: number | null;
+  readonly value: Promise<AccountObservation>;
+  result?: AccountObservation;
+};
+
 class AccountMemory {
   private readonly last = new Map<string, { read: AccountRead; at: number }>();
-  private readonly quiet = new Map<string, { until: number; detail: string }>();
+  private readonly quiet = new Map<string, { until: number; failure: ReadFailure }>();
+  private readonly shared = new Map<string, CachedRead>();
+  // The dashboard's relay times out at 40 seconds. If it disappears, clear the hold after a minute.
+  private readonly resets = new Map<string, { id: string; until: number }>();
 
   /** Forgets the accounts under this prefix that the hub no longer lists. */
-  keepOnly(prefix: string, keys: ReadonlySet<string>): void {
-    for (const map of [this.last, this.quiet]) {
-      for (const key of [...map.keys()]) {
-        if (key.startsWith(prefix) && !keys.has(key)) {
-          map.delete(key);
-        }
+  keepOnly(prefix: string, keys: ReadonlySet<string>, now: number): void {
+    for (const key of this.last.keys()) {
+      if (key.startsWith(prefix) && !keys.has(key)) this.last.delete(key);
+    }
+    for (const [slot, entry] of this.shared) {
+      // An overlapping pool request may have an older list. Keep the slot's in-flight
+      // request until it finishes, even if that list does not include its credential.
+      if (slot.startsWith(prefix) && entry.at !== null && !keys.has(entry.key)) this.shared.delete(slot);
+    }
+    for (const [key, wait] of this.quiet) {
+      if (wait.until <= now || (prefix === "codex\u0000" && key.startsWith(prefix) && !keys.has(key))) {
+        this.quiet.delete(key);
       }
     }
+  }
+
+  /** A file update or a disable/enable cycle may reuse the same upstream login. */
+  private backoffKey(key: string): string {
+    return key.startsWith("claude\u0000") ? key.slice(0, key.lastIndexOf("\u0000")) : key;
+  }
+
+  /** One current Claude observation shared between the pool and the reset check. */
+  readShared(key: string, host: Host, fetchRead: () => Promise<ReadResult>): Promise<AccountObservation> {
+    if (this.resetInProgress(key, host.monotonic())) {
+      return Promise.resolve(RESET_IN_PROGRESS);
+    }
+    const now = host.now();
+    if (this.backoffLeft(key, now) > 0) {
+      return this.read(key, now, fetchRead);
+    }
+    const slot = this.backoffKey(key);
+    const hit = this.shared.get(slot);
+    if (hit?.at === null && hit.key !== key) {
+      const retry = () => this.readShared(key, host, fetchRead);
+      return hit.value.then(retry, retry);
+    }
+    if (hit?.key === key && (hit.at === null || host.monotonic() - hit.at < HUB_CACHE_S)) {
+      return hit.value;
+    }
+    const entry: CachedRead = { key, at: null, value: this.read(key, now, fetchRead, () => host.now()) };
+    this.shared.set(slot, entry);
+    entry.value.then(
+      (result) => {
+        if (result.detail !== null && this.shared.get(slot) === entry) {
+          this.shared.delete(slot);
+        }
+        entry.result = result;
+        entry.at = host.monotonic();
+      },
+      () => {
+        if (this.shared.get(slot) === entry) this.shared.delete(slot);
+      },
+    );
+    return entry.value;
+  }
+
+  resetInProgress(key: string, now: number): boolean {
+    const slot = this.backoffKey(key);
+    const active = this.resets.get(slot);
+    if (active && now < active.until) {
+      return true;
+    }
+    this.resets.delete(slot);
+    return false;
+  }
+
+  /** Forget the reading before the claim can start and hold off reads until the claim ends. */
+  reserveReset(key: string, now: number): string | null {
+    const slot = this.backoffKey(key);
+    if (this.resetInProgress(key, now) || this.shared.get(slot)?.at === null) {
+      return null;
+    }
+    for (const [oldKey, active] of this.resets) {
+      if (now >= active.until) this.resets.delete(oldKey);
+    }
+    const id = randomUUID();
+    this.resets.set(slot, { id, until: now + HUB_CACHE_S });
+    this.shared.delete(slot);
+    for (const observation of this.last.keys()) {
+      if (observation.startsWith(`${slot}\u0000`)) this.last.delete(observation);
+    }
+    return id;
+  }
+
+  finishReset(key: string, id: string): void {
+    const slot = this.backoffKey(key);
+    if (this.resets.get(slot)?.id === id) {
+      this.resets.delete(slot);
+    }
+  }
+
+  /** An awaited credential check can outlive or overlap eviction of the reading. */
+  stillCurrent(key: string, result: Observation, now: number): boolean {
+    return this.shared.get(this.backoffKey(key))?.result === result && now < this.freshUntil(key);
+  }
+
+  freshUntil(key: string): number {
+    const slot = this.backoffKey(key);
+    const entry = this.shared.get(slot);
+    if (entry?.key === key && entry.at !== null) {
+      return entry.at + HUB_CACHE_S;
+    }
+    return this.resets.get(slot)?.until ?? Infinity;
+  }
+
+  backoffLeft(key: string, now: number): number {
+    return Math.max(0, Math.ceil((this.quiet.get(this.backoffKey(key))?.until ?? now) - now));
   }
 
   /** The account's reading now: read upstream, or the last good one while it fails or rests. */
@@ -281,30 +427,37 @@ class AccountMemory {
     key: string,
     now: number,
     fetchRead: () => Promise<ReadResult>,
-  ): Promise<{ read: AccountRead; at: number; detail: string | null } | { detail: string }> {
-    const resting = this.quiet.get(key);
-    let failed: string;
+    retryFrom = () => now,
+  ): Promise<AccountObservation> {
+    const waitKey = this.backoffKey(key);
+    const resting = this.quiet.get(waitKey);
+    let failed: ReadFailure;
     if (resting && now < resting.until) {
-      failed = resting.detail;
+      failed = resting.failure;
     } else {
       const got = await fetchRead();
       if (!("detail" in got)) {
         this.last.set(key, { read: got, at: now });
-        this.quiet.delete(key);
+        if ((this.quiet.get(waitKey)?.until ?? now) <= now) {
+          this.quiet.delete(waitKey);
+        }
         return { read: got, at: now, detail: null };
       }
-      failed = got.detail;
+      failed = got;
       if (got.retryAfter !== null) {
-        this.quiet.set(key, { until: now + Math.max(HUB_CACHE_S, got.retryAfter), detail: got.detail });
+        const until = retryFrom() + Math.max(HUB_CACHE_S, got.retryAfter);
+        if ((this.quiet.get(waitKey)?.until ?? now) < until) {
+          this.quiet.set(waitKey, { until, failure: got });
+        }
       }
     }
     const kept = this.last.get(key);
     if (!kept || now - kept.at > HUB_STALE_S) {
-      return { detail: failed };
+      return failed;
     }
     // a window that has reset since is no longer running
     const windows = kept.read.windows.filter((w) => w.resetsAt > now);
-    return { read: { ...kept.read, windows }, at: kept.at, detail: failed };
+    return { read: { ...kept.read, windows }, at: kept.at, detail: failed.detail, failure: failed };
   }
 }
 
@@ -314,14 +467,12 @@ function labelOf(file: Record<string, unknown>, provider: Source, place: number)
   return note && !note.includes("@") ? note : `${provider} ${place}`;
 }
 
-/** Every account of one provider on the hub, read upstream now (or from memory, see AccountMemory). */
-async function readProvider(
+async function listAccounts(
   provider: Source,
   options: HubServeOptions,
-  memory: AccountMemory,
+  managementKey: string,
   host: Host,
-): Promise<JsonObject> {
-  const managementKey = keyFile(options, "management-key");
+): Promise<Record<string, unknown>[]> {
   let response: Response;
   try {
     response = await host.fetch(`${options.cliproxy}/v0/management/auth-files`, {
@@ -343,24 +494,84 @@ async function readProvider(
   if (!Array.isArray(files)) {
     throw new HubFailure(502, "CLIProxyAPI's management API listed no accounts agent-pace reads");
   }
-  const mine = files.filter(
+  return files.filter(
     (f): f is Record<string, unknown> =>
       isRecord(f) && typeof f.provider === "string" && f.provider.trim().toLowerCase() === provider,
   );
-  let version = CLAUDE_CLI_FALLBACK;
-  if (provider === "claude") {
-    try {
-      version = claudeCliVersion(options.state, host);
-    } catch {
-      // the built-in one
+}
+
+function claudeVersion(options: HubServeOptions, host: Host): string {
+  try {
+    return claudeCliVersion(options.state, host);
+  } catch {
+    return CLAUDE_CLI_FALLBACK;
+  }
+}
+
+/** The index identifies a slot. A relogin in that slot must discard its old observation. */
+function claudeRevision(file: Record<string, unknown>): string {
+  const fields = ["id", "name", "email", "created_at", "modtime", "last_refresh"];
+  return digest(
+    JSON.stringify(fields.map((key) => (typeof file[key] === "string" ? file[key] : null))),
+  ).toString("hex");
+}
+
+function claudeAccountKey(index: string, revision: string): string {
+  return `claude\u0000${index}\u0000${revision}`;
+}
+
+function accountKey(provider: Source, index: string, file: Record<string, unknown>): string {
+  return provider === "claude" ? claudeAccountKey(index, claudeRevision(file)) : `codex\u0000${index}`;
+}
+
+/** Concurrent list requests can complete out of order. Later requests own the current list. */
+class AccountDirectory {
+  private sequence = 0;
+  private readonly latest = new Map<Source, { requested: number; files: Record<string, unknown>[] }>();
+
+  constructor(
+    private readonly options: HubServeOptions,
+    private readonly host: Host,
+  ) {}
+
+  async refresh(provider: Source, managementKey: string): Promise<void> {
+    const requested = ++this.sequence;
+    const files = await listAccounts(provider, this.options, managementKey, this.host);
+    if (requested > (this.latest.get(provider)?.requested ?? 0)) {
+      this.latest.set(provider, { requested, files });
     }
   }
+
+  files(provider: Source): readonly Record<string, unknown>[] {
+    return this.latest.get(provider)?.files ?? [];
+  }
+}
+
+/** Every account of one provider on the hub, read upstream now (or from memory, see AccountMemory). */
+async function readProvider(
+  provider: Source,
+  options: HubServeOptions,
+  memory: AccountMemory,
+  directory: AccountDirectory,
+  host: Host,
+): Promise<{ body: JsonObject; freshUntil: number }> {
+  const managementKey = keyFile(options, "management-key");
+  await directory.refresh(provider, managementKey);
+  const mine = directory.files(provider);
+  const version = provider === "claude" ? claudeVersion(options, host) : "";
   const observedAt = host.now();
-  const keyOf = (authIndex: string) => `${provider}\u0000${authIndex}`;
   memory.keepOnly(
-    keyOf(""),
-    new Set(mine.flatMap((f) => (typeof f.auth_index === "string" ? [keyOf(f.auth_index)] : []))),
+    `${provider}\u0000`,
+    new Set(
+      mine.flatMap((f) =>
+        typeof f.auth_index === "string" && (provider !== "claude" || f.disabled !== true)
+          ? [accountKey(provider, f.auth_index, f)]
+          : [],
+      ),
+    ),
+    observedAt,
   );
+  let freshUntil = Infinity;
   const accounts = await Promise.all(
     mine.map(async (file, i): Promise<JsonObject> => {
       const weight = isPythonInt(file.weight) && typeof file.weight === "number" ? file.weight : null;
@@ -388,11 +599,18 @@ async function readProvider(
       if (typeof authIndex !== "string" || !authIndex) {
         return left("unreadable", "the hub lists it without an auth_index");
       }
-      const got = await memory.read(keyOf(authIndex), host.now(), () =>
+      const key = accountKey(provider, authIndex, file);
+      const got =
         provider === "claude"
-          ? readClaudeAccount(options, managementKey, authIndex, version, host)
-          : readCodexAccount(options, managementKey, authIndex, file, host),
-      );
+          ? await memory.readShared(key, host, () =>
+              readClaudeAccount(options, managementKey, authIndex, version, host, "pool"),
+            )
+          : await memory.read(key, host.now(), () =>
+              readCodexAccount(options, managementKey, authIndex, file, host),
+            );
+      if (provider === "claude" && (got.detail === null || got === RESET_IN_PROGRESS)) {
+        freshUntil = Math.min(freshUntil, memory.freshUntil(key));
+      }
       if (!("read" in got)) {
         return left("unreadable", got.detail);
       }
@@ -408,61 +626,175 @@ async function readProvider(
       };
     }),
   );
-  return { version: HUB_ANSWER_VERSION, provider, observed_at: float(observedAt), accounts };
+  return {
+    body: { version: HUB_ANSWER_VERSION, provider, observed_at: float(observedAt), accounts },
+    freshUntil,
+  };
 }
 
 /**
  * The service's request handler. GET /v1/usage/<claude|codex> (or the same under /agent-pace,
- * as the tailnet address has it) with the hub's access key answers each account's usage, read
- * at most once a minute per provider however many clients ask.
+ * as the tailnet address has it) with the hub's access key answers each account's usage. The
+ * local dashboard uses the management-key reset-grant route for fresh Claude grants.
  */
 export function hubHandler(options: HubServeOptions, host: Host): (request: Request) => Promise<Response> {
   const memory = new AccountMemory();
-  const cache = new Map<Source, { at: number | null; value: Promise<JsonObject> }>();
-  const cached = (provider: Source): Promise<JsonObject> => {
+  const directory = new AccountDirectory(options, host);
+  type Snapshot = { body: JsonObject; freshUntil: number };
+  type PoolRead = { until: number | null; value: Promise<Snapshot> };
+  const cache = new Map<Source, PoolRead>();
+  const cached = (provider: Source): PoolRead => {
     const hit = cache.get(provider);
-    // a read in flight is shared; a finished one is kept a minute from when it finished
-    if (hit && (hit.at === null || host.monotonic() - hit.at < HUB_CACHE_S)) {
-      return hit.value;
+    if (hit && (hit.until === null || host.monotonic() < hit.until)) {
+      return hit;
     }
-    const entry: { at: number | null; value: Promise<JsonObject> } = {
-      at: null,
-      value: readProvider(provider, options, memory, host),
+    const entry: PoolRead = {
+      until: null,
+      value: readProvider(provider, options, memory, directory, host),
     };
     cache.set(provider, entry);
     entry.value.then(
-      () => {
-        entry.at = host.monotonic();
+      ({ freshUntil }) => {
+        entry.until = Math.min(host.monotonic() + HUB_CACHE_S, freshUntil);
       },
       () => {
-        // a failed read is not kept: the next request tries again
         if (cache.get(provider) === entry) {
           cache.delete(provider);
         }
       },
     );
-    return entry.value;
+    return entry;
   };
 
+  async function poolResponse(provider: Source): Promise<Response> {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const entry = cached(provider);
+      const { body } = await entry.value;
+      if (cache.get(provider) === entry) {
+        return answer(200, body);
+      }
+    }
+    return answer(503, { error: "the usage changed while it was read; try again" });
+  }
+
+  async function resetGrant(request: Request, url: URL): Promise<Response> {
+    const managementKey = keyFile(options, "management-key");
+    if (!authorized(request, managementKey)) {
+      return answer(401, { error: "the hub's management key is required" }, { "www-authenticate": "Bearer" });
+    }
+    const index = url.searchParams.get("auth_index");
+    const revision = request.headers.get("x-auth-revision");
+    if (!index || revision === null || !/^[0-9a-f]{64}$/.test(revision)) {
+      return answer(400, { error: "an account and its credential revision are required" });
+    }
+    const key = claudeAccountKey(index, revision);
+    const reservation = request.headers.get("x-reset-reservation");
+    if (request.method === "DELETE") {
+      if (!reservation) return answer(400, { error: "a reset reservation is required" });
+      memory.finishReset(key, reservation);
+      cache.delete("claude");
+      return answer(200, { released: true });
+    }
+    let requestedGrant: string | null = null;
+    if (request.method === "POST") {
+      const body: unknown = await request.json().catch(() => null);
+      if (!isRecord(body) || typeof body.grant !== "string" || !body.grant) {
+        return answer(400, { error: "the confirmed reset grant is required" });
+      }
+      requestedGrant = body.grant;
+    }
+    const sameCredential = async (): Promise<boolean> => {
+      await directory.refresh("claude", managementKey);
+      const file = directory.files("claude").find((candidate) => candidate.auth_index === index);
+      return file !== undefined && file.disabled !== true && claudeRevision(file) === revision;
+    };
+    const credentialChanged = () =>
+      answer(409, { code: "credential_changed", error: "the account changed; refresh the dashboard" });
+    if (!(await sameCredential())) {
+      return credentialChanged();
+    }
+    const got = await memory.readShared(key, host, async () => {
+      const result = await readClaudeAccount(
+        options,
+        managementKey,
+        index,
+        claudeVersion(options, host),
+        host,
+        "reset",
+      );
+      cache.delete("claude");
+      return result;
+    });
+    if (!(await sameCredential())) {
+      return credentialChanged();
+    }
+    if (got === RESET_IN_PROGRESS || memory.resetInProgress(key, host.monotonic())) {
+      return answer(409, { code: "reset_in_progress", error: RESET_IN_PROGRESS.detail });
+    }
+    const wait = memory.backoffLeft(key, host.now());
+    if (wait > 0) {
+      return answer(
+        429,
+        { error: "Claude is rate limiting usage checks" },
+        { "retry-after": numberText(wait) },
+      );
+    }
+    if (got.detail !== null || !("read" in got)) {
+      const failed = "read" in got ? got.failure?.upstreamStatus : got.upstreamStatus;
+      return answer(502, { error: got.detail, upstream_status: failed ?? null });
+    }
+    const changed = () =>
+      answer(409, {
+        code: "grant_changed",
+        error: "Claude's next reset changed; check the account again",
+      });
+    if (!memory.stillCurrent(key, got, host.monotonic())) {
+      return changed();
+    }
+    const current = got.read.grant;
+    const grant =
+      current && (current.expires_at === null || current.expires_at > host.now()) ? current : null;
+    if (request.method === "POST") {
+      if (grant?.id !== requestedGrant) {
+        return changed();
+      }
+      const id = memory.reserveReset(key, host.monotonic());
+      if (id === null) return answer(409, { code: "reset_in_progress", error: RESET_IN_PROGRESS.detail });
+      cache.delete("claude");
+      return answer(200, { reservation: id });
+    }
+    return answer(200, { grant });
+  }
+
   return async (request) => {
-    const path = new URL(request.url).pathname.replace(/^\/agent-pace(?=\/)/, "");
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/^\/agent-pace(?=\/)/, "");
     const provider = SOURCES.find((s) => path === `/v1/usage/${s}`);
     // /v1/hub says this is the service without reading any account, so a client that has not
     // met this address yet can tell it from a gateway within a short wait
-    if (provider === undefined && path !== HUB_HELLO) {
+    const isGrant = path === "/v1/claude/reset-grant";
+    if (!isGrant && provider === undefined && path !== HUB_HELLO) {
       return answer(404, { error: "not found" });
     }
-    if (request.method !== "GET") {
-      return answer(405, { error: "only GET" }, { allow: "GET" });
+    if (
+      request.method !== "GET" &&
+      !(isGrant && (request.method === "POST" || request.method === "DELETE"))
+    ) {
+      return answer(
+        405,
+        { error: isGrant ? "only GET, POST and DELETE" : "only GET" },
+        { allow: isGrant ? "GET, POST, DELETE" : "GET" },
+      );
     }
     try {
+      if (isGrant) return await resetGrant(request, url);
       if (!authorized(request, keyFile(options, "access-key"))) {
         return answer(401, { error: "the hub's access key is required" }, { "www-authenticate": "Bearer" });
       }
       if (provider === undefined) {
         return answer(200, { version: HUB_ANSWER_VERSION });
       }
-      return answer(200, await cached(provider));
+      return await poolResponse(provider);
     } catch (error) {
       const failure =
         error instanceof HubFailure

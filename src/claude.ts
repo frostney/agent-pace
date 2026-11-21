@@ -111,6 +111,51 @@ export const CLAUDE_WINDOWS = [
   { key: "seven_day", name: "7d", lengthS: 7 * 86400 },
 ] as const;
 
+/** The exact grant Claude marks usable now, for the hub's management-key reset check. */
+export function claudeResetGrant(
+  data: unknown,
+  now: number,
+): { id: string; expires_at: number | null; clears: string[] } | null {
+  const block = get(data, "cedar_ember");
+  if (!isRecord(block) || block.eligible !== true || !Array.isArray(block.grants)) {
+    return null;
+  }
+  const next = block.grants.find((grant) => isRecord(grant) && grant.id === block.next_grant_id);
+  const resetsLeft = isRecord(next) ? amountOf(next.resets_left) : null;
+  if (
+    !isRecord(next) ||
+    typeof next.id !== "string" ||
+    !/^[a-z0-9_-]{1,40}$/.test(next.id) ||
+    resetsLeft === null ||
+    !Number.isInteger(resetsLeft) ||
+    resetsLeft <= 0 ||
+    next.paused === true ||
+    next.usable_now !== true
+  ) {
+    return null;
+  }
+  let expiresAt: number | null = null;
+  if (next.ends_at != null) {
+    if (
+      typeof next.ends_at !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(next.ends_at)
+    ) {
+      return null;
+    }
+    expiresAt = Date.parse(next.ends_at) / 1000;
+    if (!(expiresAt > now)) {
+      return null;
+    }
+  }
+  const listed = Array.isArray(next.clears) && next.clears.length > 0 ? next.clears : null;
+  const clears = listed
+    ? CLAUDE_WINDOWS.filter((window) => listed.includes(window.key)).map((window) => window.name)
+    : next.type === "session"
+      ? ["5h"]
+      : ["5h", "7d"];
+  return clears.length > 0 ? { id: next.id, expires_at: expiresAt, clears } : null;
+}
+
 /**
  * Banked Claude resets (what /limit-reset claims) from the usage response's cedar_ember
  * block. A grant with resets left that is not paused is banked; ends_at is when it expires.
