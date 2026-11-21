@@ -182,7 +182,8 @@ class FakeCliproxy {
   files: Fields[] = AUTH_FILES.map((f) => ({ ...f }));
   answers = upstreamAnswers();
   listStatus = 200;
-  onRelay: ((body: Fields) => void) | undefined;
+  onList: (() => Promise<Response>) | undefined;
+  onRelay: ((body: Fields) => void | Promise<void>) | undefined;
   /** The Retry-After the upstream sends with a 429, as api-call reports it. */
   retryAfter: string | null = null;
   readonly calls: { path: string; authorization: string | null; body: Fields | null }[] = [];
@@ -199,10 +200,12 @@ class FakeCliproxy {
       return new Response('{"error":"invalid management key"}', { status: 401 });
     }
     if (parsed.pathname === "/v0/management/auth-files" && (init.method ?? "GET") === "GET") {
-      return new Response(JSON.stringify({ files: this.files }), { status: this.listStatus });
+      return (
+        this.onList?.() ?? new Response(JSON.stringify({ files: this.files }), { status: this.listStatus })
+      );
     }
     if (parsed.pathname === "/v0/management/api-call" && init.method === "POST" && body) {
-      this.onRelay?.(body);
+      await this.onRelay?.(body);
       const [status, answer] = this.answers[String(body.auth_index)]?.[String(body.url)] ?? [404, {}];
       const header = status === 429 && this.retryAfter ? { "Retry-After": [this.retryAfter] } : {};
       return new Response(JSON.stringify({ status_code: status, header, body: JSON.stringify(answer) }));
@@ -540,6 +543,46 @@ describe("HubService", () => {
     await handle(grantRequest(undefined, "DELETE", MANAGEMENT_KEY, reservation));
     expect((await handle(grantRequest())).status).toBe(429);
     expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(2);
+  });
+
+  test("an older listing cannot evict a read in flight or restore a grant after reservation", async () => {
+    const handle = service();
+    const answers = cliproxy.answers.a1 as Record<string, [number, unknown]>;
+    answers[USAGE_URL] = [200, grantUsage("grant_before")];
+    const listed = Promise.withResolvers<void>();
+    const oldList = Promise.withResolvers<Response>();
+    cliproxy.onList = () => {
+      cliproxy.onList = undefined;
+      listed.resolve();
+      return oldList.promise;
+    };
+    const oldPool = handle(get("/v1/usage/claude"));
+    await listed.promise;
+
+    const started = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    cliproxy.onRelay = async (call) => {
+      if (call.auth_index === "a1") {
+        started.resolve();
+        await resume.promise;
+      }
+    };
+    const preview = handle(grantRequest());
+    await started.promise;
+    oldList.resolve(Response.json({ files: cliproxy.files.slice(1) }));
+    await oldPool;
+    const confirm = handle(grantRequest(undefined, "POST", MANAGEMENT_KEY, "grant_before"));
+    await Bun.sleep(0);
+    resume.resolve();
+    await preview;
+    expect((await confirm).status).toBe(200);
+    expect(cliproxy.upstreamCalls().filter((call) => call.auth_index === "a1")).toHaveLength(1);
+
+    c.clock += 60;
+    mono += 60;
+    answers[USAGE_URL] = [429, {}];
+    const read = (await (await handle(get("/v1/usage/claude"))).json()) as { accounts: Fields[] };
+    expect(read.accounts[0]).toMatchObject({ state: "unreadable", detail: "HTTP 429", banked: null });
   });
 
   test("metadata changes and disable/enable keep the account's active usage backoff", async () => {

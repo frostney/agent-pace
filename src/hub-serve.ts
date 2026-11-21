@@ -298,7 +298,12 @@ type Observation = {
   readonly failure?: ReadFailure;
 };
 type AccountObservation = Observation | ReadFailure;
-type CachedRead = { at: number | null; readonly value: Promise<AccountObservation> };
+type CachedRead = {
+  readonly key: string;
+  at: number | null;
+  readonly value: Promise<AccountObservation>;
+  result?: AccountObservation;
+};
 
 class AccountMemory {
   private readonly last = new Map<string, { read: AccountRead; at: number }>();
@@ -309,12 +314,13 @@ class AccountMemory {
 
   /** Forgets the accounts under this prefix that the hub no longer lists. */
   keepOnly(prefix: string, keys: ReadonlySet<string>, now: number): void {
-    for (const map of [this.last, this.shared]) {
-      for (const key of [...map.keys()]) {
-        if (key.startsWith(prefix) && !keys.has(key)) {
-          map.delete(key);
-        }
-      }
+    for (const key of this.last.keys()) {
+      if (key.startsWith(prefix) && !keys.has(key)) this.last.delete(key);
+    }
+    for (const [slot, entry] of this.shared) {
+      // An overlapping pool request may have an older list. Keep the slot's in-flight
+      // request until it finishes, even if that list does not include its credential.
+      if (slot.startsWith(prefix) && entry.at !== null && !keys.has(entry.key)) this.shared.delete(slot);
     }
     for (const [key, wait] of this.quiet) {
       if (wait.until <= now || (prefix === "codex\u0000" && key.startsWith(prefix) && !keys.has(key))) {
@@ -337,21 +343,27 @@ class AccountMemory {
     if (this.backoffLeft(key, now) > 0) {
       return this.read(key, now, fetchRead);
     }
-    const hit = this.shared.get(key);
-    if (hit && (hit.at === null || host.monotonic() - hit.at < HUB_CACHE_S)) {
+    const slot = this.backoffKey(key);
+    const hit = this.shared.get(slot);
+    if (hit?.at === null && hit.key !== key) {
+      const retry = () => this.readShared(key, host, fetchRead);
+      return hit.value.then(retry, retry);
+    }
+    if (hit?.key === key && (hit.at === null || host.monotonic() - hit.at < HUB_CACHE_S)) {
       return hit.value;
     }
-    const entry: CachedRead = { at: null, value: this.read(key, now, fetchRead, () => host.now()) };
-    this.shared.set(key, entry);
+    const entry: CachedRead = { key, at: null, value: this.read(key, now, fetchRead, () => host.now()) };
+    this.shared.set(slot, entry);
     entry.value.then(
       (result) => {
-        if (result.detail !== null && this.shared.get(key) === entry) {
-          this.shared.delete(key);
+        if (result.detail !== null && this.shared.get(slot) === entry) {
+          this.shared.delete(slot);
         }
+        entry.result = result;
         entry.at = host.monotonic();
       },
       () => {
-        if (this.shared.get(key) === entry) this.shared.delete(key);
+        if (this.shared.get(slot) === entry) this.shared.delete(slot);
       },
     );
     return entry.value;
@@ -369,19 +381,18 @@ class AccountMemory {
 
   /** Forget the reading before the claim can start and hold off reads until the claim ends. */
   reserveReset(key: string, now: number): string | null {
-    if (this.resetInProgress(key, now)) {
+    const slot = this.backoffKey(key);
+    if (this.resetInProgress(key, now) || this.shared.get(slot)?.at === null) {
       return null;
     }
     for (const [oldKey, active] of this.resets) {
       if (now >= active.until) this.resets.delete(oldKey);
     }
     const id = randomUUID();
-    const slot = this.backoffKey(key);
     this.resets.set(slot, { id, until: now + HUB_CACHE_S });
-    for (const map of [this.shared, this.last]) {
-      for (const observation of map.keys()) {
-        if (observation.startsWith(`${slot}\u0000`)) map.delete(observation);
-      }
+    this.shared.delete(slot);
+    for (const observation of this.last.keys()) {
+      if (observation.startsWith(`${slot}\u0000`)) this.last.delete(observation);
     }
     return id;
   }
@@ -394,13 +405,17 @@ class AccountMemory {
   }
 
   /** An awaited credential check can outlive or overlap eviction of the reading. */
-  stillCurrent(key: string, result: Promise<AccountObservation>, now: number): boolean {
-    return this.shared.get(key)?.value === result && now < this.freshUntil(key);
+  stillCurrent(key: string, result: Observation, now: number): boolean {
+    return this.shared.get(this.backoffKey(key))?.result === result && now < this.freshUntil(key);
   }
 
   freshUntil(key: string): number {
-    const at = this.shared.get(key)?.at;
-    return at == null ? (this.resets.get(this.backoffKey(key))?.until ?? Infinity) : at + HUB_CACHE_S;
+    const slot = this.backoffKey(key);
+    const entry = this.shared.get(slot);
+    if (entry?.key === key && entry.at !== null) {
+      return entry.at + HUB_CACHE_S;
+    }
+    return this.resets.get(slot)?.until ?? Infinity;
   }
 
   backoffLeft(key: string, now: number): number {
@@ -660,7 +675,7 @@ export function hubHandler(options: HubServeOptions, host: Host): (request: Requ
     if (!(await sameCredential())) {
       return credentialChanged();
     }
-    const reading = memory.readShared(key, host, async () => {
+    const got = await memory.readShared(key, host, async () => {
       const result = await readClaudeAccount(
         options,
         managementKey,
@@ -672,7 +687,6 @@ export function hubHandler(options: HubServeOptions, host: Host): (request: Requ
       cache.delete("claude");
       return result;
     });
-    const got = await reading;
     if (!(await sameCredential())) {
       return credentialChanged();
     }
@@ -696,7 +710,7 @@ export function hubHandler(options: HubServeOptions, host: Host): (request: Requ
         code: "grant_changed",
         error: "Claude's next reset changed; check the account again",
       });
-    if (!memory.stillCurrent(key, reading, host.monotonic())) {
+    if (!memory.stillCurrent(key, got, host.monotonic())) {
       return changed();
     }
     const current = got.read.grant;
