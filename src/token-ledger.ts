@@ -181,7 +181,7 @@ function idKey(id: string): string {
  * are read; linked directories are not entered, as lane counting does not enter them.
  */
 function sessionFiles(root: string, after: number, source: Source): Map<string, number> {
-  const found: { path: string; size: number; born: number }[] = [];
+  const found: { path: string; size: number; born: number; modified: number }[] = [];
   const walk = (dir: string) => {
     let names: string[];
     try {
@@ -209,12 +209,13 @@ function sessionFiles(root: string, after: number, source: Source): Map<string, 
         (source === "claude" || name.startsWith("rollout-")) &&
         stat.mtimeMs / 1000 >= after
       ) {
-        found.push({ path, size: stat.size, born: stat.birthtimeMs || stat.mtimeMs });
+        found.push({ path, size: stat.size, born: stat.birthtimeMs || stat.mtimeMs, modified: stat.mtimeMs });
       }
     }
   };
   walk(root);
-  found.sort((a, b) => a.born - b.born);
+  // Some filesystems give a session and its fork the same creation time.
+  found.sort((a, b) => a.born - b.born || a.modified - b.modified);
   return new Map(found.map(({ path, size }) => [path, size]));
 }
 
