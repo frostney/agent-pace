@@ -8,6 +8,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   utimesSync,
   writeFileSync,
@@ -197,7 +198,20 @@ describe("TokenLedger", () => {
   test("on a first reading a fork's copies go to the session that wrote them", async () => {
     const original = lane("a", 3, 1);
     const fork = join(c.dir, "claude-home/projects/proj/0-fork.jsonl"); // listed before the original
-    writeFileSync(fork, readFileSync(original, "utf8"));
+    const messages = readFileSync(original, "utf8");
+    const originalBorn = statSync(original).birthtimeMs;
+    // The ledger sorts by creation time wherever it is available. Distinguish the two files
+    // on filesystems that record nearby writes with the same creation timestamp.
+    for (let attempt = 0; ; attempt += 1) {
+      writeFileSync(fork, messages);
+      const forkBorn = statSync(fork).birthtimeMs;
+      if (!originalBorn || !forkBorn || forkBorn > originalBorn) {
+        break;
+      }
+      expect(attempt).toBeLessThan(20);
+      rmSync(fork);
+      await Bun.sleep(10);
+    }
     utimesSync(fork, NOW - 30, NOW - 30);
     utimesSync(original, NOW - 90, NOW - 90);
     const use = await ledger();
